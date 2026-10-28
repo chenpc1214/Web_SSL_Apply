@@ -1,0 +1,297 @@
+@page "/collect-cert"
+@rendermode InteractiveServer
+@implements IDisposable
+@using SslWebConsole.Models
+@using SslWebConsole.Services
+@inject DomainRepository DomainRepo
+@inject CertCollectService CollectSvc
+@inject CertificateOrderRepository OrderRepo
+@inject NicSrsConfigLoader ConfigLoader
+@inject FlowModeService FlowMode
+@inject OrderStatusService OrderStatusSvc
+@inject CsrService CsrSvc
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+
+<PageTitle>步驟5 · 等待簽發</PageTitle>
+
+<h1 class="h3 mb-1">步驟5 · 等待簽發</h1>
+<p class="hint mb-4">逐一查詢憑證是否已簽發，單一網域卡住不會擋住其他網域。只顯示已下單、還沒簽發的網域；已簽發的請到 <a href="/overview">總覽</a> 查看。</p>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-sm align-middle">
+                <thead><tr><th></th><th>CommonName</th><th>Status</th><th></th></tr></thead>
+                <tbody>
+                    @foreach (var row in PagedRows)
+                    {
+                        var outcome = _outcomes.GetValueOrDefault(row.CommonName);
+                        <tr>
+                            <td>
+                                <input class="form-check-input" type="checkbox" checked="@_selected.Contains(row.CommonName)"
+                                       @onchange="e => ToggleSelect(row.CommonName, (bool)e.Value!)" disabled="@_running" />
+                            </td>
+                            <td>
+                                @row.CommonName
+                                @if (_holdMap.TryGetValue(row.CommonName.Trim(), out var holdSince))
+                                {
+                                    <span class="badge text-bg-warning ms-1" title="開頁預設不勾選、輪詢跳過；步驟6封存也會略過">暫緩中・@holdSince.ToString("MM/dd") 起</span>
+                                }
+                            </td>
+                            <td>
+                                @if (outcome is null)
+                                {
+                                    <span class="badge text-bg-secondary">尚未查詢</span>
+                                }
+                                else
+                                {
+                                    <span class="badge @StatusBadgeClass(outcome.Status)">@outcome.Status</span>
+                                    <span class="hint">@outcome.Detail</span>
+                                }
+                            </td>
+                            <td class="text-end text-nowrap">
+                                <button class="btn btn-outline-secondary btn-sm me-1" disabled="@_running"
+                                        title="@(_holdMap.ContainsKey(row.CommonName.Trim()) ? "恢復成一般狀態，下次開頁會自動勾選" : "客戶那邊卡住、短期不會簽發時用：開頁預設不勾選、輪詢跳過，步驟6封存也略過")"
+                                        @onclick="() => ToggleHold(row)">@(_holdMap.ContainsKey(row.CommonName.Trim()) ? "取消暫緩" : "暫緩")</button>
+                                @if (_reissueNames.Contains(row.CommonName.Trim()))
+                                {
+                                    <span class="hint me-2" title="重簽沿用既有訂閱，沒有新訂單可以作廢">重簽</span>
+                                }
+                                else
+                                {
+                                    <button class="btn btn-outline-secondary btn-sm me-1" disabled="@_running"
+                                            title="買錯要重新下單時用：訂單標記作廢、網域回到步驟1/3，CSR 和私鑰保留"
+                                            @onclick="() => CancelOrder(row)">作廢訂單</button>
+                                }
+                                <button class="btn-icon danger" title="刪除網域" disabled="@_running" @onclick="() => DeleteDomain(row)"><i class="bi bi-trash"></i></button>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+            <Pager TotalCount="VisibleRows.Count" PageSize="PageSize" @bind-CurrentPage="_page" />
+        </div>
+
+        <div class="d-flex gap-3 align-items-center mt-2">
+            <div class="form-check">
+                <input class="form-check-input" type="checkbox" id="onceCheck" @bind="_once" disabled="@_running" />
+                <label class="form-check-label" for="onceCheck">只查一次（不等待輪詢）</label>
+            </div>
+            <button class="btn btn-primary" @onclick="Start" disabled="@(_running || _selected.Count == 0)">開始</button>
+            <button class="btn btn-outline-danger" @onclick="Stop" disabled="@(!_running)">停止</button>
+            @if (_countdownSeconds is > 0)
+            {
+                <span class="badge text-bg-info"><i class="bi bi-hourglass-split me-1"></i>@_countdownSeconds 秒後查詢下一輪</span>
+            }
+        </div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="section-title mb-2"><i class="bi bi-clock-history me-1"></i>輪詢紀錄</div>
+        <div class="log-panel">@string.Join("\n", _log)</div>
+    </div>
+</div>
+
+@code {
+    private List<DomainRecord> _rows = [];
+    private readonly HashSet<string> _selected = [];
+    private readonly Dictionary<string, CertPollOutcome> _outcomes = new();
+    private readonly List<string> _log = [];
+    private bool _once;
+    private bool _running;
+    private CancellationTokenSource? _cts;
+    private int? _countdownSeconds;
+
+    protected override void OnInitialized()
+    {
+        if (FlowMode.Current is null) { Nav.NavigateTo("/"); return; }
+
+        _rows = DomainRepo.LoadAll();
+        ReloadOrders();
+        _pageSize = ConfigLoader.Load().PageSize;
+        // 暫緩中的不預設勾選——輪詢時就會跳過；要單獨查一次的話手動勾起來就好。
+        foreach (var r in VisibleRows.Where(r => !_holdMap.ContainsKey(r.CommonName.Trim())))
+            _selected.Add(r.CommonName);
+    }
+
+    /// <summary>暫緩中的網域跟標記時間（存資料庫，重開機/重新部署不會消失）。</summary>
+    private Dictionary<string, DateTime> _holdMap = new(StringComparer.OrdinalIgnoreCase);
+
+    private void ToggleHold(DomainRecord row)
+    {
+        var name = row.CommonName.Trim();
+        var onHold = !_holdMap.ContainsKey(name);
+        DomainRepo.SetHold(name, onHold);
+        if (onHold) _selected.Remove(row.CommonName);
+        else _selected.Add(row.CommonName);
+        ReloadOrders();
+        AppendLog(onHold
+            ? $"[{name}] 已暫緩：輪詢跳過、步驟6封存略過。"
+            : $"[{name}] 已取消暫緩。");
+    }
+
+    /// <summary>訂單狀態一次撈進字典，畫面一律查這裡；輪詢回報結果時（可能剛變成 Issued）才重撈。</summary>
+    private Dictionary<string, OrderSummary> _orderMap = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>清單上屬於「重簽」的網域（不能作廢，只能刪除）。重簽的訂單之前簽發過，資料庫留著
+    /// IssuedAt；資料庫沒記錄到的（例如終端機 .ps1 時代的網域）再看資料夾有沒有 .replace.json。</summary>
+    private HashSet<string> _reissueNames = new(StringComparer.OrdinalIgnoreCase);
+
+    private void ReloadOrders()
+    {
+        _orderMap = OrderRepo.GetLatestAll();
+        _holdMap = DomainRepo.LoadHoldMap();
+        _reissueNames = VisibleRows
+            .Select(r => r.CommonName.Trim())
+            .Where(name => _orderMap.GetValueOrDefault(name)?.IssuedAt is not null || OrderStatusSvc.HasReissueRecord(name))
+            .ToHashSet(StringComparer.OrdinalIgnoreCase);
+    }
+
+    /// <summary>買錯（例如年期）要重新下單：資料庫訂單標記 Failed、本機 .certid 改名，網域資料保留，
+    /// 會自動回到步驟1/步驟3 的清單（那兩頁本來就顯示訂單 Failed 的網域）。NicSRS 那邊的訂單要
+    /// 自己手動取消——沒取消的話重新下單時雲端查重會看到 PENDING 擋下來，不會重複扣款。</summary>
+    private async Task CancelOrder(DomainRecord row)
+    {
+        var name = row.CommonName.Trim();
+        var order = _orderMap.GetValueOrDefault(name);
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            icon = "warning",
+            title = $"確定要作廢「{name}」的訂單嗎？",
+            text = (string.IsNullOrWhiteSpace(order?.CertId) ? "" : $"請記得到 NicSRS 手動取消這張訂單（{order?.CertId}）。")
+                + "作廢後這個網域會回到步驟1和步驟3，可以修改年期後重新下單；CSR 和私鑰會保留。",
+            confirmText = "確定作廢",
+            danger = true,
+        });
+        if (!confirmed) return;
+
+        OrderRepo.RecordFailed(name, order?.CertId);
+        DomainRepo.SetHold(name, false); // 作廢後要重新下單，暫緩標記跟著這張舊訂單一起結束
+        string? renamed = null;
+        try { renamed = OrderStatusSvc.CancelLocalCertId(name); }
+        catch (Exception ex) { AppendLog($"[{name}] .certid 改名失敗：{ex.Message}（重新下單時需勾「強制下單」）"); }
+
+        _selected.Remove(row.CommonName);
+        _outcomes.Remove(row.CommonName);
+        ReloadOrders();
+        AppendLog($"[{name}] 已作廢訂單" + (renamed is null ? "" : $"，本機 .certid 已改名為 {renamed}") + "。請到步驟1修改後重新下單。");
+    }
+
+    /// <summary>客戶已經不用（例如 DNS 改走了）：連同訂單紀錄從資料庫刪除，並刪掉 CRT_Preparatory_Area
+    /// 裡這個網域的資料夾（沒有資料夾就跳過）——留著的話沒有 PFX，步驟6封存每次都會列在「略過」。
+    /// 資料夾刪除沿用步驟2「刪除並重新開始」的 CsrService.DeleteAndRestart。</summary>
+    private async Task DeleteDomain(DomainRecord row)
+    {
+        var name = row.CommonName.Trim();
+        var hasFolder = CsrSvc.DomainFolderExists(name);
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            icon = "warning",
+            title = $"確定要刪除「{name}」嗎？",
+            text = "會連同訂單紀錄一起從資料庫刪除"
+                + (hasFolder ? "，並刪除本機的網域資料夾（含 CSR、私鑰）" : "")
+                + "，無法復原。",
+            confirmText = "確定刪除",
+            danger = true,
+        });
+        if (!confirmed) return;
+
+        DomainRepo.Delete(name);
+        _rows.Remove(row);
+        _selected.Remove(row.CommonName);
+        _outcomes.Remove(row.CommonName);
+        ReloadOrders();
+
+        var folderMessage = "";
+        if (hasFolder)
+        {
+            try
+            {
+                CsrSvc.DeleteAndRestart(name);
+                folderMessage = "，本機網域資料夾也已刪除";
+            }
+            catch (Exception ex)
+            {
+                folderMessage = $"，但本機網域資料夾刪除失敗：{ex.Message}（請手動刪除）";
+            }
+        }
+        AppendLog($"[{name}] 已從資料庫刪除{folderMessage}。");
+    }
+
+    /// <summary>只留「有訂單、還沒簽發」的——沒下單的沒東西可查，已簽發的不用再輪詢。</summary>
+    private List<DomainRecord> VisibleRows => _rows.Where(r =>
+        _orderMap.GetValueOrDefault(r.CommonName.Trim()) is { Status: not "Issued" }).ToList();
+
+    private int _pageSize = 20;
+    private int PageSize => _pageSize;
+    private int _page = 1;
+    private List<DomainRecord> PagedRows => VisibleRows.Skip((_page - 1) * PageSize).Take(PageSize).ToList();
+
+    private void ToggleSelect(string name, bool isChecked)
+    {
+        if (isChecked) _selected.Add(name); else _selected.Remove(name);
+    }
+
+    private void AppendLog(string message) => _log.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {message}");
+
+    private async Task Start()
+    {
+        _running = true;
+        _cts = new CancellationTokenSource();
+        var queue = _rows.Where(r => _selected.Contains(r.CommonName))
+            .Select(r => (r.CommonName, (string?)null))
+            .ToList();
+
+        try
+        {
+            await CollectSvc.PollQueueAsync(
+                queue,
+                _once,
+                outcome => InvokeAsync(() =>
+                {
+                    _outcomes[outcome.CommonName] = outcome;
+                    // 暫緩中的被手動勾起來查、結果已經簽發了：暫緩自動結束，接著照常打包、封存。
+                    if (outcome.Status == CertPollStatus.Complete && _holdMap.ContainsKey(outcome.CommonName.Trim()))
+                    {
+                        DomainRepo.SetHold(outcome.CommonName, false);
+                        AppendLog($"[{outcome.CommonName}] 已簽發，自動取消暫緩。");
+                    }
+                    ReloadOrders();
+                    AppendLog($"[{outcome.CommonName}] {outcome.Status}: {outcome.Detail}");
+                    StateHasChanged();
+                }),
+                info => InvokeAsync(() =>
+                {
+                    AppendLog(info);
+                    StateHasChanged();
+                }),
+                _cts.Token,
+                onCountdown: secs => InvokeAsync(() =>
+                {
+                    _countdownSeconds = secs > 0 ? secs : null;
+                    StateHasChanged();
+                }));
+        }
+        finally
+        {
+            _running = false;
+            _countdownSeconds = null;
+            StateHasChanged();
+        }
+    }
+
+    private void Stop() => _cts?.Cancel();
+
+    private static string StatusBadgeClass(CertPollStatus status) => status switch
+    {
+        CertPollStatus.Complete => "text-bg-success",
+        CertPollStatus.Pending => "text-bg-warning",
+        CertPollStatus.Failed => "text-bg-danger",
+        _ => "text-bg-danger",
+    };
+
+    public void Dispose() => _cts?.Cancel();
+}

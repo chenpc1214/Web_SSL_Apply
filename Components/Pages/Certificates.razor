@@ -1,0 +1,245 @@
+@page "/certificates"
+@rendermode InteractiveServer
+@using SslWebConsole.Models
+@using SslWebConsole.Services
+@inject CertFileScanService ScanSvc
+@inject PfxService PfxSvc
+@inject PfxPasswordService PfxPasswordSvc
+@inject NicSrsConfigLoader ConfigLoader
+@inject WorkRootResolver WorkRootRes
+@inject FlowModeService FlowMode
+@inject CertArchiveService ArchiveSvc
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+
+<PageTitle>步驟6 · 整理清單 / 打包 PFX</PageTitle>
+
+<h1 class="h3 mb-1">步驟6 · 整理清單 / 打包 PFX</h1>
+<p class="hint mb-1">掃描各網域資料夾裡的憑證檔案，整理成清單並打包成 PFX。</p>
+<details class="help mb-4">
+    <summary><i class="bi bi-info-circle me-1"></i>說明</summary>
+    <p class="hint mb-0">清單固定寫到 <code>@ScanSvc.OutputCsvPath</code>；PFX 集中輸出到 <code>@_outputFolder</code>。</p>
+</details>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="d-flex gap-2 flex-wrap">
+            <button class="btn btn-primary" @onclick="Scan" disabled="@_busy" title="掃描各網域資料夾裡的 .crt / .key / .ca-bundle">掃描憑證檔</button>
+            <button class="btn btn-outline-secondary" @onclick="LoadExisting" disabled="@(_busy || !File.Exists(ScanSvc.OutputCsvPath))" title="@(File.Exists(ScanSvc.OutputCsvPath) ? "" : "檔案還不存在，請先按「掃描」再「儲存為 CSV」")">載入現有清單</button>
+            <button class="btn btn-outline-primary" @onclick="SaveCsv" disabled="@(_busy || _groups.Count == 0)">儲存為 CSV</button>
+            <button class="btn btn-outline-primary" @onclick="PackAll" disabled="@(_busy || _groups.Count == 0)">全部打包 PFX</button>
+        </div>
+
+        <div class="table-responsive mt-3">
+            <table class="table table-sm align-middle">
+                <thead><tr><th>Domain</th><th>CertPath</th><th>KeyPath</th><th>BundlePath</th><th>PFX</th><th>Password</th><th></th></tr></thead>
+                <tbody>
+                    @foreach (var g in PagedGroups)
+                    {
+                        var result = _pfxResults.GetValueOrDefault(g.Domain);
+                        var revealed = _revealedPasswords.GetValueOrDefault(g.Domain);
+                        var pwError = _passwordErrors.GetValueOrDefault(g.Domain);
+                        <tr>
+                            <td>@g.Domain</td>
+                            <td class="hint">@g.CertPath</td>
+                            <td class="hint">@g.KeyPath</td>
+                            <td class="hint">@(g.BundlePath ?? "(無)")</td>
+                            <td>
+                                @if (result is null)
+                                {
+                                    <span class="badge text-bg-secondary">未打包</span>
+                                }
+                                else
+                                {
+                                    <span class="badge @(result.Success ? "text-bg-success" : "text-bg-danger")">@(result.Success ? "完成" : "失敗")</span>
+                                }
+                            </td>
+                            <td>
+                                @if (pwError is not null)
+                                {
+                                    <span class="text-danger small">@pwError</span>
+                                }
+                                else if (revealed is not null)
+                                {
+                                    <code>@revealed</code>
+                                    <button class="btn btn-link btn-sm p-0 ms-1" @onclick="() => HidePassword(g)">隱藏</button>
+                                }
+                                else
+                                {
+                                    <button class="btn btn-outline-secondary btn-sm" @onclick="() => RevealPassword(g)">顯示密碼</button>
+                                }
+                            </td>
+                            <td><button class="btn btn-outline-secondary btn-sm" @onclick="() => Pack(g)" disabled="@_busy">打包 PFX</button></td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+            <Pager TotalCount="_groups.Count" PageSize="PageSize" @bind-CurrentPage="_page" />
+        </div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="section-title"><i class="bi bi-archive me-1"></i>收尾：封存本輪檔案</div>
+        <p class="hint">把已打包 PFX 的網域資料夾（含私鑰）搬到封存資料夾，並清掉 PFX_Storage 裡的 PFX 複本。還沒打包 PFX 的資料夾會自動跳過。</p>
+        @if (string.IsNullOrWhiteSpace(_archiveRoot))
+        {
+            <div class="d-flex gap-2 align-items-center flex-wrap">
+                <button class="btn btn-outline-primary" disabled><i class="bi bi-archive me-1"></i>封存並清理</button>
+                <span class="hint">請先到 <a href="/settings">公用設定</a> 填寫「封存資料夾」。</span>
+            </div>
+        }
+        else
+        {
+            <div class="d-flex gap-2 align-items-center flex-wrap">
+                <button class="btn btn-outline-primary" disabled="@_busy" @onclick="RequestArchive"><i class="bi bi-archive me-1"></i>封存並清理</button>
+                <span class="hint">封存到 <code>@_archiveRoot</code></span>
+            </div>
+        }
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="section-title mb-2"><i class="bi bi-terminal me-1"></i>執行紀錄</div>
+        <div class="log-panel">@string.Join("\n", _log)</div>
+    </div>
+</div>
+
+@code {
+    private List<CertFileGroup> _groups = [];
+    private readonly Dictionary<string, PfxResult> _pfxResults = new();
+    private readonly Dictionary<string, string> _revealedPasswords = new();
+    private readonly Dictionary<string, string> _passwordErrors = new();
+    private readonly List<string> _log = [];
+    private bool _busy;
+    private string _outputFolder = "";
+    private string _archiveRoot = "";
+
+    private int _pageSize = 20;
+    private int PageSize => _pageSize;
+    private int _page = 1;
+    private List<CertFileGroup> PagedGroups => _groups.Skip((_page - 1) * PageSize).Take(PageSize).ToList();
+
+    protected override void OnInitialized()
+    {
+        if (FlowMode.Current is null) { Nav.NavigateTo("/"); return; }
+
+        // PFX 集中輸出放在 WorkRoot 的上一層（跟 Certificates_List.csv 同一層），
+        // 不是塞進 WorkRoot 裡面跟各網域工作資料夾混在一起，也不是固定在 ScriptsRoot。
+        _outputFolder = Path.Combine(WorkRootRes.ResolveOutputRoot(), "PFX_Storage");
+        var config = ConfigLoader.Load();
+        _pageSize = config.PageSize;
+        _archiveRoot = (config.ArchiveRoot ?? "").Trim();
+    }
+
+    /// <summary>「封存並清理」：先列出會搬哪些、跳過哪些、刪幾個 PFX，確認後才真的動檔案。
+    /// 跨磁碟搬移要複製整個資料夾，放到背景執行緒跑，不卡住畫面。</summary>
+    private async Task RequestArchive()
+    {
+        var plan = ArchiveSvc.Plan();
+        if (plan.Ready.Count == 0 && plan.PfxFiles.Count == 0)
+        {
+            AppendLog(plan.Skipped.Count > 0
+                ? $"沒有可封存的資料夾（{plan.Skipped.Count} 個略過：{string.Join("、", plan.Skipped.Select(s => $"{Path.GetFileName(s.Dir)}（{s.Reason}）"))}）。"
+                : "沒有需要封存的資料夾，也沒有要清除的 PFX。");
+            return;
+        }
+
+        var skippedNames = plan.Skipped.Select(s => $"{Path.GetFileName(s.Dir)}（{s.Reason}）").ToList();
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            icon = "warning",
+            title = $"確定要封存 {plan.Ready.Count} 個網域資料夾嗎？",
+            text = $"搬到 {plan.ArchiveRoot}，並刪除 PFX_Storage 裡的 {plan.PfxFiles.Count} 個 PFX 複本。"
+                + (skippedNames.Count > 0 ? $"另有 {skippedNames.Count} 個會跳過：{string.Join("、", skippedNames)}。" : ""),
+            items = plan.Ready.Select(d => Path.GetFileName(d)).ToList(),
+            confirmText = "確定封存",
+        });
+        if (!confirmed) return;
+
+        _busy = true;
+        try
+        {
+            var result = await Task.Run(() => ArchiveSvc.Archive(plan));
+            foreach (var line in result.Log) AppendLog(line);
+            AppendLog($"封存完成：搬移 {result.Moved} 個、失敗 {result.Failed} 個、刪除 PFX {result.PfxDeleted} 個。");
+
+            // 清單上的路徑都指向剛搬走的資料夾，留著會誤導，清空等下一輪重新掃描。
+            _groups.Clear();
+            _pfxResults.Clear();
+            _page = 1;
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"封存失敗：{ex.Message}");
+        }
+        finally { _busy = false; }
+    }
+
+    private void AppendLog(string message) => _log.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {message}");
+
+    private void Scan()
+    {
+        _groups = ScanSvc.Scan();
+        _page = 1;
+        AppendLog($"掃描完成，找到 {_groups.Count} 組完整憑證（.crt+.key）。");
+    }
+
+    private void LoadExisting()
+    {
+        _groups = ScanSvc.LoadCsv();
+        _page = 1;
+        AppendLog($"已載入 {_groups.Count} 筆既有清單。");
+    }
+
+    private void SaveCsv()
+    {
+        ScanSvc.SaveCsv(_groups);
+        AppendLog($"已儲存 {_groups.Count} 筆到 {ScanSvc.OutputCsvPath}");
+    }
+
+    private async Task Pack(CertFileGroup g)
+    {
+        _busy = true;
+        try
+        {
+            var result = await PfxSvc.CreateAsync(g, _outputFolder);
+            _pfxResults[g.Domain] = result;
+            AppendLog($"[{g.Domain}] {(result.Success ? "打包完成" : "打包失敗")}: {result.Message}");
+        }
+        finally { _busy = false; }
+    }
+
+    private void RevealPassword(CertFileGroup g)
+    {
+        try
+        {
+            var folderName = DomainFolderNaming.ToFolderName(g.Domain);
+            _revealedPasswords[g.Domain] = PfxPasswordSvc.ComputePassword(folderName);
+            _passwordErrors.Remove(g.Domain);
+        }
+        catch (InvalidOperationException ex)
+        {
+            _passwordErrors[g.Domain] = ex.Message;
+        }
+    }
+
+    private void HidePassword(CertFileGroup g) => _revealedPasswords.Remove(g.Domain);
+
+    private async Task PackAll()
+    {
+        _busy = true;
+        try
+        {
+            foreach (var g in _groups)
+            {
+                var result = await PfxSvc.CreateAsync(g, _outputFolder);
+                _pfxResults[g.Domain] = result;
+                AppendLog($"[{g.Domain}] {(result.Success ? "打包完成" : "打包失敗")}: {result.Message}");
+            }
+        }
+        finally { _busy = false; }
+    }
+}

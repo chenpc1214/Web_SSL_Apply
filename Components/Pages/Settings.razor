@@ -1,0 +1,168 @@
+@page "/settings"
+@rendermode InteractiveServer
+@using SslWebConsole.Services
+@inject NicSrsConfigLoader ConfigLoader
+@inject WorkRootResolver WorkRootResolverSvc
+
+<PageTitle>公用設定</PageTitle>
+
+<h1 class="h3 mb-1">公用設定</h1>
+<p class="hint mb-4">設定存在資料庫（<code>sslautomation.db</code>）。</p>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="section-title"><i class="bi bi-folder2 me-1"></i>資料夾設定</div>
+        <p class="hint">所有網域資料夾（.key / CSR / 憑證 / PFX）統一建立在這裡；步驟2~6 都以此為準。留空則退回專案所在目錄。</p>
+        <label class="form-label">WorkRoot</label>
+        <input class="form-control" @bind="_cfg.WorkRoot" placeholder="例如 C:\Certs\WorkRoot（不存在會自動建立）" />
+
+        <label class="form-label mt-3">封存資料夾（選填）</label>
+        <input class="form-control" @bind="_cfg.ArchiveRoot" placeholder="例如 D:\Certs\Archive（不存在會自動建立）" />
+        <div class="hint mt-1">步驟6「封存並清理」會把已打包 PFX 的網域資料夾搬到這裡；沒填的話那個按鈕不能按。</div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="section-title mb-2"><i class="bi bi-plug me-1"></i>API 設定</div>
+        <label class="form-label">ApiBase</label>
+        <input class="form-control" @bind="_cfg.ApiBase" />
+
+        <label class="form-label mt-3">ApiToken</label>
+        <div class="input-group">
+            <input class="form-control" type="@(_showToken ? "text" : "password")" @bind="_cfg.ApiToken" />
+            <button class="btn btn-outline-secondary" type="button" @onclick="() => _showToken = !_showToken">@(_showToken ? "隱藏" : "顯示")</button>
+        </div>
+
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="section-title mb-2"><i class="bi bi-arrow-repeat me-1"></i>輪詢設定（步驟5）</div>
+        <label class="form-label">PollIntervalSeconds（每輪間隔秒數）</label>
+        <input class="form-control" type="number" min="1" @bind="_cfg.PollIntervalSeconds" />
+
+        <label class="form-label mt-3">PollMaxMinutes（輪詢上限分鐘數）</label>
+        <input class="form-control" type="number" min="1" @bind="_cfg.PollMaxMinutes" />
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="section-title mb-2"><i class="bi bi-layout-text-window me-1"></i>顯示設定</div>
+        <label class="form-label">每頁筆數（所有清單頁共用：/domains、/csr、/order-status、/webconfig-upload、/collect-cert、/certificates、/overview）</label>
+        <input class="form-control" style="max-width: 200px;" type="number" min="1" @bind="_cfg.PageSize" />
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="section-title mb-2"><i class="bi bi-person-vcard me-1"></i>聯絡人資訊（下單時提供給 CA）</div>
+        <div class="row g-3">
+            <div class="col-md-6"><label class="form-label">FirstName</label><input class="form-control" @bind="_cfg.Administrator.FirstName" /></div>
+            <div class="col-md-6"><label class="form-label">LastName</label><input class="form-control" @bind="_cfg.Administrator.LastName" /></div>
+            <div class="col-md-6"><label class="form-label">Job</label><input class="form-control" @bind="_cfg.Administrator.Job" /></div>
+            <div class="col-md-6"><label class="form-label">Organization</label><input class="form-control" @bind="_cfg.Administrator.Organation" /></div>
+            <div class="col-md-6"><label class="form-label">Email</label><input class="form-control" @bind="_cfg.Administrator.Email" /></div>
+            <div class="col-md-6"><label class="form-label">Mobile</label><input class="form-control" @bind="_cfg.Administrator.Mobile" /></div>
+            <div class="col-md-6"><label class="form-label">Country</label><input class="form-control" @bind="_cfg.Administrator.Country" /></div>
+            <div class="col-md-6"><label class="form-label">State</label><input class="form-control" @bind="_cfg.Administrator.State" /></div>
+            <div class="col-md-6"><label class="form-label">City</label><input class="form-control" @bind="_cfg.Administrator.City" /></div>
+            <div class="col-md-6"><label class="form-label">PostCode</label><input class="form-control" @bind="_cfg.Administrator.PostCode" /></div>
+            <div class="col-12"><label class="form-label">Address</label><input class="form-control" @bind="_cfg.Administrator.Address" /></div>
+        </div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body d-flex align-items-center gap-2">
+        <button class="btn btn-primary" @onclick="Save">儲存設定</button>
+        <button class="btn btn-outline-secondary" @onclick="Reload">重新載入</button>
+        @if (!string.IsNullOrEmpty(_message))
+        {
+            <span class="hint">@_message</span>
+        }
+    </div>
+</div>
+
+@if (_pendingMigration is not null)
+{
+    <div class="card mb-4 border-warning">
+        <div class="card-body">
+            <div class="section-title mb-2"><i class="bi bi-exclamation-triangle-fill text-warning me-1"></i>偵測到 WorkRoot 換了新路徑</div>
+            <p>
+                舊路徑 <code>@_pendingMigration.OldRoot</code> 底下還有 <strong>@_pendingMigration.Folders.Count</strong> 個網域資料夾（含 .key 或 .csr），
+                新路徑是 <code>@_pendingMigration.NewRoot</code>。
+            </p>
+            <ul class="hint">
+                @foreach (var f in _pendingMigration.Folders)
+                {
+                    <li>@System.IO.Path.GetFileName(f)</li>
+                }
+            </ul>
+            <div class="d-flex gap-2">
+                <button class="btn btn-primary" @onclick="ConfirmMigrate">搬移 @_pendingMigration.Folders.Count 個資料夾</button>
+                <button class="btn btn-outline-secondary" @onclick="() => _pendingMigration = null" title="設定已經存好，只是不搬舊資料夾">不搬移</button>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_migrationLog.Count > 0)
+{
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="section-title mb-2"><i class="bi bi-check2-circle me-1"></i>搬移結果</div>
+            <div class="log-panel">@string.Join("\n", _migrationLog)</div>
+        </div>
+    </div>
+}
+
+@code {
+    private sealed record PendingMigration(string OldRoot, string NewRoot, List<string> Folders);
+
+    private NicSrsConfig _cfg = new();
+    private bool _showToken;
+    private string _message = "";
+    private PendingMigration? _pendingMigration;
+    private readonly List<string> _migrationLog = [];
+
+    protected override void OnInitialized() => Reload();
+
+    private void Reload()
+    {
+        _cfg = ConfigLoader.Load();
+        _message = "";
+        _pendingMigration = null;
+    }
+
+    private void Save()
+    {
+        var oldRoot = WorkRootResolverSvc.Resolve(); // 讀「還沒存檔前」的舊設定
+        ConfigLoader.Save(_cfg);
+        var newRoot = WorkRootResolverSvc.Resolve(); // 讀「剛存好」的新設定
+        _message = $"已儲存，{DateTime.Now:HH:mm:ss}";
+        _migrationLog.Clear();
+
+        if (!string.Equals(Path.GetFullPath(oldRoot), Path.GetFullPath(newRoot), StringComparison.OrdinalIgnoreCase))
+        {
+            var folders = WorkRootMigrationService.FindDomainFolders(oldRoot);
+            _pendingMigration = folders.Count > 0 ? new PendingMigration(oldRoot, newRoot, folders) : null;
+        }
+        else
+        {
+            _pendingMigration = null;
+        }
+    }
+
+    private void ConfirmMigrate()
+    {
+        if (_pendingMigration is null) return;
+        var result = WorkRootMigrationService.Migrate(_pendingMigration.NewRoot, _pendingMigration.Folders);
+        _migrationLog.Clear();
+        _migrationLog.Add($"完成：搬移 {result.Moved} 個、略過 {result.Skipped} 個。");
+        _migrationLog.AddRange(result.Log);
+        _pendingMigration = null;
+    }
+}

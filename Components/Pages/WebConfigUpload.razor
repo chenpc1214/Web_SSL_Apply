@@ -1,0 +1,283 @@
+@page "/webconfig-upload"
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+@using SslWebConsole.Models
+@using SslWebConsole.Services
+@inject DomainRepository DomainRepo
+@inject ValidationUploadService UploadSvc
+@inject WebConfigPatchService WebConfigSvc
+@inject CertificateFileRepository FileRepo
+@inject CertificateOrderRepository OrderRepo
+@inject NicSrsConfigLoader ConfigLoader
+@inject FlowModeService FlowMode
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+
+<PageTitle>步驟4 · web.config 放行 / 上傳驗證檔</PageTitle>
+
+@if (_batchRunning)
+{
+    <NavigationLock ConfirmExternalNavigation="true" />
+}
+
+<h1 class="h3 mb-1">步驟4 · web.config 放行 / 上傳驗證檔</h1>
+<p class="hint mb-4">只顯示已下單、PFX 還沒打包的網域；已完成的請到 <a href="/overview">總覽</a> 查看。</p>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="section-title"><i class="bi bi-collection me-1"></i>批次處理</div>
+        <p class="hint">依序對選取的網域做「注入放行規則」+「上傳驗證檔」，不會同時平行呼叫；單筆失敗不影響其他筆。</p>
+        <div class="d-flex gap-2 flex-wrap align-items-center">
+            <button class="btn btn-outline-secondary btn-sm" disabled="@_busy" @onclick="SelectAll">全選</button>
+            <button class="btn btn-outline-secondary btn-sm" disabled="@_busy" @onclick="() => _selected.Clear()">取消全選</button>
+            <button class="btn btn-primary btn-sm" disabled="@(_selected.Count == 0 || _busy)" @onclick="StartBatch">
+                批次處理（@_selected.Count）
+            </button>
+            @if (_batchRunning)
+            {
+                <button class="btn btn-outline-danger btn-sm" @onclick="StopBatch">停止批次</button>
+                <span class="text-muted">執行中… @_batchResults.Count / @_batchTotal</span>
+            }
+        </div>
+
+        @if (_batchResults.Count > 0)
+        {
+            var successCount = _batchResults.Count(r => IsBatchSuccess(r));
+            var failedCount = _batchResults.Count(r => !IsBatchSuccess(r));
+            <div class="mt-3">
+                <div class="fw-semibold mb-2">批次結果：成功 @successCount／失敗 @failedCount</div>
+                <div class="table-responsive">
+                    <table class="table table-sm">
+                        <thead><tr><th>CommonName</th><th>web.config Rule</th><th>Validation Upload</th></tr></thead>
+                        <tbody>
+                            @foreach (var r in _batchResults)
+                            {
+                                <tr>
+                                    <td>@r.CommonName</td>
+                                    <td class="hint">@r.Patch.Outcome — @r.Patch.Message</td>
+                                    <td class="hint">@r.Upload.Outcome — @r.Upload.Message</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+                @if (failedCount > 0)
+                {
+                    <button class="btn btn-outline-danger btn-sm" disabled="@_busy" @onclick="RetryFailed">重試失敗（@failedCount）</button>
+                }
+            </div>
+        }
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-sm align-middle">
+                <thead><tr><th></th><th>CommonName</th><th>IP</th><th>Order Status</th><th>Action</th></tr></thead>
+                <tbody>
+                    @foreach (var row in PagedRows)
+                    {
+                        var hasCertId = _orderMap.ContainsKey(row.CommonName.Trim());
+                        <tr>
+                            <td>
+                                <input class="form-check-input" type="checkbox" disabled="@(!hasCertId || _busy)"
+                                       checked="@_selected.Contains(row.CommonName)"
+                                       @onchange="e => ToggleSelected(row.CommonName, (bool)e.Value!)" />
+                            </td>
+                            <td>@row.CommonName</td>
+                            <td>@row.Ip</td>
+                            <td>
+                                @if (hasCertId)
+                                {
+                                    <span class="badge text-bg-success">已下單</span>
+                                }
+                                else
+                                {
+                                    <span class="badge text-bg-warning">未下單</span>
+                                }
+                            </td>
+                            <td class="d-flex gap-2 flex-wrap">
+                                <button class="btn btn-outline-primary btn-sm" disabled="@(!hasCertId || _busy)" @onclick="() => PatchWebConfig(row)">注入放行規則</button>
+                                <button class="btn btn-outline-primary btn-sm" disabled="@(!hasCertId || _busy)" @onclick="() => UploadValidation(row)">上傳驗證檔</button>
+                                <button class="btn btn-outline-danger btn-sm" disabled="@(!hasCertId || _busy)" @onclick="() => RestoreWebConfig(row)">還原 web.config</button>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+            <Pager TotalCount="VisibleRows.Count" PageSize="PageSize" @bind-CurrentPage="_page" />
+        </div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="section-title mb-2"><i class="bi bi-terminal me-1"></i>執行紀錄</div>
+        <div class="log-panel">@string.Join("\n", _log)</div>
+    </div>
+</div>
+
+@code {
+    private sealed record BatchStepResult(string CommonName, WebConfigPatchResult Patch, ValidationUploadResult Upload);
+
+    private List<DomainRecord> _rows = [];
+    private readonly List<string> _log = [];
+    private bool _busy;
+
+    private readonly HashSet<string> _selected = new(StringComparer.OrdinalIgnoreCase);
+    private bool _batchRunning;
+    private CancellationTokenSource? _batchCts;
+    private readonly List<BatchStepResult> _batchResults = new();
+    private int _batchTotal;
+
+    protected override void OnInitialized()
+    {
+        if (FlowMode.Current is null) { Nav.NavigateTo("/"); return; }
+
+        _rows = DomainRepo.LoadAll();
+        _orderMap = OrderRepo.GetLatestAll();
+        var fileMap = FileRepo.GetAllByDomain();
+        _visibleRows = _rows.Where(r =>
+            _orderMap.ContainsKey(r.CommonName.Trim()) &&
+            !fileMap.ContainsKey(r.CommonName.Trim())).ToList();
+        _pageSize = ConfigLoader.Load().PageSize;
+    }
+
+    /// <summary>只留「有訂單、但 PFX 還沒打包」的——還沒下單的沒東西可做，已經打包完代表整條流程跑完了。
+    /// 這頁的動作（上傳驗證檔、web.config 注入/還原）不會改變訂單或打包狀態，所以載入時算一次就好，
+    /// 不用每次重繪都查資料庫。</summary>
+    private List<DomainRecord> _visibleRows = [];
+    private Dictionary<string, OrderSummary> _orderMap = new(StringComparer.OrdinalIgnoreCase);
+    private List<DomainRecord> VisibleRows => _visibleRows;
+
+    private int _pageSize = 20;
+    private int PageSize => _pageSize;
+    private int _page = 1;
+    private List<DomainRecord> PagedRows => VisibleRows.Skip((_page - 1) * PageSize).Take(PageSize).ToList();
+
+    private void AppendLog(string message) => _log.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {message}");
+
+    private async Task UploadValidation(DomainRecord row)
+    {
+        _busy = true;
+        try
+        {
+            var result = await Task.Run(() => UploadSvc.Upload(row, testMode: false));
+            AppendLog($"[{row.CommonName}] 上傳驗證檔: {result.Outcome} — {result.Message}");
+        }
+        finally { _busy = false; }
+    }
+
+    private async Task PatchWebConfig(DomainRecord row)
+    {
+        _busy = true;
+        try
+        {
+            var result = await Task.Run(() => WebConfigSvc.Patch(row));
+            AppendLog($"[{row.CommonName}] web.config 注入: {result.Outcome} — {result.Message}");
+        }
+        finally { _busy = false; }
+    }
+
+    private async Task RestoreWebConfig(DomainRecord row)
+    {
+        _busy = true;
+        try
+        {
+            var result = await Task.Run(() => WebConfigSvc.Restore(row));
+            AppendLog($"[{row.CommonName}] web.config 還原: {result.Outcome} — {result.Message}");
+        }
+        finally { _busy = false; }
+    }
+
+    private void ToggleSelected(string commonName, bool isChecked)
+    {
+        if (isChecked) _selected.Add(commonName);
+        else _selected.Remove(commonName);
+    }
+
+    private void SelectAll()
+    {
+        foreach (var row in VisibleRows)
+            _selected.Add(row.CommonName);
+    }
+
+    private static bool IsBatchSuccess(BatchStepResult r) =>
+        r.Patch.Outcome is WebConfigOutcome.Patched or WebConfigOutcome.AlreadyPatched &&
+        r.Upload.Outcome is UploadOutcome.Success;
+
+    private async Task StartBatch()
+    {
+        _batchRunning = true;
+        _busy = true;
+        _batchResults.Clear();
+        _batchCts = new CancellationTokenSource();
+        var domains = _selected.ToList();
+        _batchTotal = domains.Count;
+
+        try
+        {
+            foreach (var commonName in domains)
+            {
+                if (_batchCts.Token.IsCancellationRequested) break;
+
+                var row = _rows.FirstOrDefault(r => string.Equals(r.CommonName, commonName, StringComparison.OrdinalIgnoreCase));
+                if (row is null) continue;
+
+                var patchResult = await Task.Run(() => WebConfigSvc.Patch(row));
+                AppendLog($"[{commonName}] web.config 注入: {patchResult.Outcome} — {patchResult.Message}");
+
+                var uploadResult = await Task.Run(() => UploadSvc.Upload(row, testMode: false));
+                AppendLog($"[{commonName}] 上傳驗證檔: {uploadResult.Outcome} — {uploadResult.Message}");
+
+                _batchResults.Add(new BatchStepResult(commonName, patchResult, uploadResult));
+                _selected.Remove(commonName);
+                StateHasChanged();
+
+                if (!_batchCts.Token.IsCancellationRequested)
+                {
+                    try { await Task.Delay(500, _batchCts.Token); }
+                    catch (OperationCanceledException) { }
+                }
+            }
+        }
+        finally
+        {
+            _batchRunning = false;
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private void StopBatch() => _batchCts?.Cancel();
+
+    /// <summary>批次還在跑的時候，把「要攔」同步給瀏覽器端的 unsavedGuard（wwwroot/js/unsaved-guard.js），
+    /// 點側邊欄/站內連結會先跳 SweetAlert2 確認——這個專案路由不是互動式的，NavigationLock 的
+    /// OnBeforeInternalNavigation 攔不到站內導覽。確定離開的話頁面會被 Dispose，由 DisposeAsync
+    /// 取消還沒開始的部分（已經跑完的結果不會撤銷）。</summary>
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        _guardSynced = true;
+        try { await JS.InvokeVoidAsync("unsavedGuard.update", _batchRunning, "批次還在執行中，離開的話還沒開始的會停止（已經跑完的不會被撤銷）。"); }
+        catch (JSDisconnectedException) { }
+    }
+
+    /// <summary>OnAfterRenderAsync 只在互動式渲染時才會跑；預先渲染（prerender）那一份元件也會被
+    /// Dispose，但那時候還不能呼叫 JS，所以只有真的同步過 unsavedGuard 的才需要清。</summary>
+    private bool _guardSynced;
+
+    public async ValueTask DisposeAsync()
+    {
+        _batchCts?.Cancel();
+        if (!_guardSynced) return;
+        try { await JS.InvokeVoidAsync("unsavedGuard.clear"); }
+        catch (JSDisconnectedException) { }
+    }
+
+    private void RetryFailed()
+    {
+        foreach (var r in _batchResults.Where(r => !IsBatchSuccess(r)))
+            _selected.Add(r.CommonName);
+    }
+}

@@ -1,0 +1,699 @@
+@page "/domains"
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+@using SslWebConsole.Models
+@using SslWebConsole.Services
+@inject DomainRepository DomainRepo
+@inject LocalityRepository LocalityRepo
+@inject DnsCheckService DnsCheck
+@inject CrmSettingsRepository CrmSettingsRepo
+@inject CrmVerifyService CrmVerifySvc
+@inject ValidationUploadService FtpSvc
+@inject CertificateOrderRepository OrderRepo
+@inject NicSrsConfigLoader ConfigLoader
+@inject FlowModeService FlowMode
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+
+<PageTitle>步驟1 · CSV 輸入 / DNS 驗證</PageTitle>
+
+<NavigationLock ConfirmExternalNavigation="@HasUnsavedChanges" />
+
+<h1 class="h3 mb-1">步驟1 · CSV 輸入 / DNS 驗證</h1>
+<p class="hint mb-1">只顯示尚未下單的網域；已下單的請到 <a href="/overview">總覽</a> 按「編輯」修改。</p>
+<details class="help mb-4">
+    <summary><i class="bi bi-info-circle me-1"></i>說明</summary>
+    <p class="hint mb-0">「全部 DNS 檢查」「FTP 驗證」「CRM 校對」都直接檢查畫面上目前的內容，不用先存檔，也不會離開這頁。建議下單（步驟3，會扣款）前先確認 DNS 跟 FTP 都通過。</p>
+</details>
+
+<div class="card mb-4" data-unsaved-guard>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-sm align-middle table-stack">
+                <thead>
+                    <tr>
+                        <th>ID</th><th>CommonName</th><th>Organization</th><th>IP</th>
+                        <th>FtpUser</th><th>FtpPass</th><th>FtpFolder</th>
+                        @if (!IsReissueMode)
+                        {
+                            <th>ProductCode</th><th>Years</th>
+                        }
+                        <th>Locality</th><th></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @{ var pagedRows = PagedRows; }
+                    @for (var i = 0; i < pagedRows.Count; i++)
+                    {
+                        var row = pagedRows[i];
+                        <tr>
+                            <td data-label="ID"><input class="form-control form-control-sm" style="min-width:7ch" @bind="row.Id" /></td>
+                            <td data-label="CommonName"><input class="form-control form-control-sm" style="min-width:24ch" @bind="row.CommonName" @bind:after="() => AutoFillOrganization(row)" /></td>
+                            <td data-label="Organization"><input class="form-control form-control-sm" style="min-width:16ch" @bind="row.Organization" /></td>
+                            <td data-label="IP"><input class="form-control form-control-sm" style="min-width:14ch" @bind="row.Ip" /></td>
+                            <td data-label="FtpUser"><input class="form-control form-control-sm" style="min-width:14ch" @bind="row.FtpUser" /></td>
+                            <td data-label="FtpPass"><input class="form-control form-control-sm" style="min-width:14ch" type="text" @bind="row.FtpPass" /></td>
+                            <td data-label="FtpFolder"><input class="form-control form-control-sm" style="min-width:16ch" @bind="row.FtpFolder" /></td>
+                            @if (!IsReissueMode)
+                            {
+                                <td data-label="ProductCode">
+                                    <select class="form-select form-select-sm" style="min-width:16ch" @bind="row.ProductCode">
+                                        <option value="">（未選）</option>
+                                        @foreach (var productCode in PlaceOrderService.AllowedProductCodes)
+                                        {
+                                            <option value="@productCode">@productCode</option>
+                                        }
+                                    </select>
+                                </td>
+                                <td data-label="Years">
+                                    <select class="form-select form-select-sm" style="min-width:7ch" @bind="row.Years">
+                                        <option value="">（未選）</option>
+                                        @for (var y = 1; y <= 5; y++)
+                                        {
+                                            <option value="@y">@y</option>
+                                        }
+                                    </select>
+                                </td>
+                            }
+                            <td data-label="Locality">
+                                <select class="form-select form-select-sm" style="min-width:16ch" @bind="row.Locality">
+                                    <option value="">（未選）</option>
+                                    @foreach (var locality in _localities)
+                                    {
+                                        <option value="@locality.Name">@locality.DisplayLabel</option>
+                                    }
+                                </select>
+                            </td>
+                            <td class="text-end"><button class="btn-icon danger" title="刪除" @onclick="() => RequestDelete(row)"><i class="bi bi-trash"></i></button></td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+            <Pager TotalCount="VisibleRows.Count" PageSize="PageSize" @bind-CurrentPage="_page" />
+        </div>
+
+        <div class="mt-3">
+            <div class="hint text-uppercase" style="font-size:0.7rem; letter-spacing:.05em;">資料維護</div>
+            <div class="d-flex align-items-center gap-2 mt-1 flex-wrap">
+                <button class="btn btn-outline-secondary" @onclick="AddRow">新增列</button>
+                <button class="btn btn-primary" @onclick="RequestSave">儲存</button>
+                <button class="btn btn-outline-secondary" @onclick="RequestExportCsv" disabled="@(VisibleRows.Count == 0)" title="只匯出畫面上目前顯示的網域">匯出 CSV</button>
+                <button class="btn btn-outline-secondary" @onclick="DoImportCsv">匯入 CSV</button>
+            </div>
+            <span class="hint" style="font-size:0.75rem;">只匯出畫面上目前顯示的網域（不含已下單、已篩掉的），備份/相容用途，不影響網頁操作</span>
+            <br />
+            <span class="hint" style="font-size:0.75rem;">「匯入 CSV」讀回上面「匯出」寫的那個固定檔案，依 CommonName 合併進畫面（同名覆蓋、新的網域新增），匯入完還是要按「儲存」才會真的寫進資料庫</span>
+        </div>
+
+        <div class="mt-3">
+            <div class="hint text-uppercase" style="font-size:0.7rem; letter-spacing:.05em;">驗證（檢查畫面上目前的內容，不用先存檔）</div>
+            <div class="d-flex align-items-center gap-2 mt-1 flex-wrap">
+                <button class="btn btn-outline-primary" @onclick="RunDnsCheck" disabled="@_checking">@(_checking ? "檢查中..." : "全部 DNS 檢查")</button>
+                <button class="btn btn-outline-primary" @onclick="RunFtpCheck" disabled="@_ftpChecking">@(_ftpChecking ? "驗證中..." : "FTP 驗證")</button>
+                <button class="btn btn-outline-primary" @onclick="RunCrmVerify" disabled="@_crmRunning">@(_crmRunning ? "校對中..." : "CRM 校對")</button>
+                @if (_crmRunning)
+                {
+                    <button class="btn btn-outline-danger btn-sm" @onclick="StopCrmVerify">停止</button>
+                }
+            </div>
+        </div>
+
+        @if (!string.IsNullOrEmpty(_saveMessage))
+        {
+            <p class="hint mt-2 mb-0">@_saveMessage</p>
+        }
+        @if (_pendingRenewalCount > 0)
+        {
+            <p class="small fw-semibold mt-1 mb-0 text-primary-emphasis"><i class="bi bi-info-circle me-1"></i>已標記待換發，請到 <a href="/overview">總覽</a> 確認。</p>
+        }
+    </div>
+</div>
+
+@if (_dnsResults is not null)
+{
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="section-title mb-2 d-flex align-items-center gap-2 flex-wrap">
+                <span><i class="bi bi-globe me-1"></i>DNS 驗證結果</span>
+                <span class="badge text-bg-success">OK @_dnsResults.Count(r => r.Status == DnsStatus.Ok)</span>
+                @{ var warnCount = _dnsResults.Count(r => r.Status == DnsStatus.OkWwwWarn); }
+                @if (warnCount > 0)
+                {
+                    <span class="badge text-bg-warning" title="主網域正常，但 www 子網域沒對到 CSV 的 IP">www異常 @warnCount</span>
+                }
+                @{ var okWwwCount = _dnsResults.Count(r => r.Status == DnsStatus.OkWww); }
+                @if (okWwwCount > 0)
+                {
+                    <span class="badge text-bg-warning" title="主網域沒對到，但 www 子網域正常——網域欄會自動改成 www.CommonName">OK-www @okWwwCount</span>
+                }
+                @{ var failCount = _dnsResults.Count(r => r.Status == DnsStatus.Fail); }
+                @if (failCount > 0)
+                {
+                    <span class="badge text-bg-danger">FAIL @failCount</span>
+                }
+            </div>
+            <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                    <thead>
+                        <tr><th>CommonName</th><th>Status</th><th>Root IP</th><th>WWW IP</th><th>Note</th></tr>
+                    </thead>
+                    <tbody>
+                        @foreach (var r in _dnsResults)
+                        {
+                            <tr>
+                                <td>@r.EffectiveCommonName</td>
+                                <td><span class="badge @StatusBadgeClass(r.Status)">@r.StatusLabel</span></td>
+                                <td><span class="badge @IpMatchBadgeClass(r, r.MainMatch)" title="@r.MainIpDisplay">@IpMatchBadgeLabel(r, r.MainMatch)</span></td>
+                                <td><span class="badge @IpMatchBadgeClass(r, r.WwwMatch)" title="@r.WwwIpDisplay">@IpMatchBadgeLabel(r, r.WwwMatch)</span></td>
+                                <td>@r.Remark</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_ftpResults.Count > 0)
+{
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="section-title"><i class="bi bi-hdd-network me-1"></i>FTP 驗證結果</div>
+            <p class="hint">只測連線與遠端資料夾是否存在，不會上傳任何檔案。</p>
+            <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                    <thead><tr><th>CommonName</th><th>Result</th><th>Message</th></tr></thead>
+                    <tbody>
+                        @foreach (var r in _ftpResults)
+                        {
+                            <tr>
+                                <td>@r.CommonName</td>
+                                <td><span class="badge @FtpOutcomeBadgeClass(r.Outcome)">@r.Outcome</span></td>
+                                <td class="hint">@r.Message</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+}
+
+@if (_crmResults.Count > 0)
+{
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="section-title"><i class="bi bi-person-check me-1"></i>CRM 校對結果</div>
+            <p class="hint">校對的是上面表格目前顯示的內容（不管有沒有存檔）。只顯示差異，不會自動改資料；覺得 CRM 的值才對，自己回上面表格改掉再按「儲存」。</p>
+            <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                    <thead><tr><th style="width:14%">Case No</th><th style="width:20%">CommonName</th><th>Result</th></tr></thead>
+                    <tbody>
+                        @foreach (var r in _crmResults)
+                        {
+                            <tr>
+                                <td>@r.CaseNo</td>
+                                <td>@r.CommonName</td>
+                                <td>
+                                    <span class="badge @CrmOutcomeBadgeClass(r.Outcome)">@CrmOutcomeLabel(r)</span>
+                                    @if (!string.IsNullOrEmpty(r.Note))
+                                    {
+                                        <div class="hint" style="font-size:0.75rem;">@r.Note</div>
+                                    }
+                                    @if (r.Diffs.Count > 0)
+                                    {
+                                        <table class="table table-sm mt-1 mb-0" style="max-width:600px;">
+                                            <thead><tr><th>Field</th><th>Current</th><th>CRM</th></tr></thead>
+                                            <tbody>
+                                                @foreach (var d in r.Diffs)
+                                                {
+                                                    <tr>
+                                                        <td>@d.Field</td>
+                                                        <td class="text-danger">@d.CurrentValue</td>
+                                                        <td class="text-success">@d.CrmValue</td>
+                                                    </tr>
+                                                }
+                                            </tbody>
+                                        </table>
+                                    }
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+            </div>
+            <p class="hint mb-0">共 @_crmResults.Count 筆　通過 @_crmResults.Count(x => x.Outcome == CrmVerifyOutcome.Ok)
+                不一致 @_crmResults.Count(x => x.Outcome == CrmVerifyOutcome.Diff)
+                查無/失敗 @_crmResults.Count(x => x.Outcome is CrmVerifyOutcome.NotFound or CrmVerifyOutcome.ParseFailed or CrmVerifyOutcome.Error or CrmVerifyOutcome.LoginRequired)</p>
+        </div>
+    </div>
+}
+
+@code {
+    private List<DomainRecord> _rows = [];
+    /// <summary>這次頁面存活期間手動新增/匯入的列（依物件參考識別，不是網域名稱）——不管
+    /// 它的 CommonName 打完後查出來是不是已經 Issued 的舊網域，都要在這頁繼續顯示，讓使用者
+    /// 有機會編輯完、按到「儲存」，不能讓它一填完名稱就從畫面上直接消失。</summary>
+    private readonly HashSet<DomainRecord> _editingRows = new();
+    private List<LocalityOption> _localities = [];
+    private List<DnsCheckResult>? _dnsResults;
+    private string _saveMessage = "";
+    private int _pendingRenewalCount;
+    private bool _checking;
+
+    private readonly List<CrmVerifyResult> _crmResults = [];
+    private bool _crmRunning;
+    private CancellationTokenSource? _crmCts;
+
+    private readonly List<ValidationUploadResult> _ftpResults = [];
+    private bool _ftpChecking;
+
+    private bool IsReissueMode => FlowMode.Current == SslWebConsole.Services.FlowMode.Reissue;
+
+    /// <summary>
+    /// 預設只顯示尚未下單／訂單失敗的網域（這頁定位是「這次要處理的新資料」），已下單的
+    /// 請去 /overview 按「編輯」——會導到專屬的 /domains/edit 頁面改資料，不會混進這頁、
+    /// 也不用一個全域勾選框把所有歷史資料整批攤開。純看資料庫（CertificateOrderRepository），
+    /// 不看 .certid 檔案存不存在——檔案會因為封存/搬移資料夾而不在，資料庫不會。
+    /// </summary>
+    private List<DomainRecord> VisibleRows =>
+        _rows.Where(r =>
+            string.IsNullOrWhiteSpace(r.CommonName) ||
+            _editingRows.Contains(r) ||
+            _pendingRenewalMap.GetValueOrDefault(r.CommonName.Trim()) ||
+            LatestOrder(r.CommonName) is null or { Status: "Failed" }
+        ).ToList();
+
+    // ★ 訂單狀態、續約標記一次撈進字典，畫面一律查這裡——這頁每個輸入框改完都會重繪，
+    // 不能每次重繪都對每一列各查一次資料庫。存檔（會改續約標記）之後才用 ReloadStatusMaps() 重撈。
+    private Dictionary<string, bool> _pendingRenewalMap = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, OrderSummary> _orderMap = new(StringComparer.OrdinalIgnoreCase);
+
+    private OrderSummary? LatestOrder(string commonName) => _orderMap.GetValueOrDefault(commonName.Trim());
+
+    private void ReloadStatusMaps()
+    {
+        _pendingRenewalMap = DomainRepo.LoadPendingRenewalMap();
+        _orderMap = OrderRepo.GetLatestAll();
+    }
+
+    private int _pageSize = 20;
+    private int PageSize => _pageSize;
+    private int _page = 1;
+    private List<DomainRecord> PagedRows => VisibleRows.Skip((_page - 1) * PageSize).Take(PageSize).ToList();
+
+    protected override void OnInitialized()
+    {
+        if (FlowMode.Current is null) { Nav.NavigateTo("/"); return; }
+
+        _localities = LocalityRepo.GetAllOptions();
+        _rows = DomainRepo.LoadAll();
+        ReloadStatusMaps();
+        _pageSize = ConfigLoader.Load().PageSize;
+        if (VisibleRows.Count == 0) AddRow();
+        TakeSavedSnapshot();
+    }
+
+    /// <summary>
+    /// 「上次存檔（或載入）當下」每一列的欄位內容，依物件參考記住——用來判斷畫面上有沒有
+    /// 還沒按「儲存」的修改。新增的列只要還是全空白就不算修改（載入時自動加的那列空白列、
+    /// 按了「新增列」但沒填，離開都不用提醒）；刪除是立即寫資料庫的，列不在 _rows 裡就不用比。
+    /// </summary>
+    private readonly Dictionary<DomainRecord, string> _savedSnapshot = new(ReferenceEqualityComparer.Instance);
+
+    private static string Fingerprint(DomainRecord r) => string.Join("",
+        r.Id, r.CommonName, r.Organization, r.Ip, r.FtpUser, r.FtpPass, r.FtpFolder,
+        r.ProductCode, r.Years, r.Locality, r.Remark);
+
+    private static readonly string BlankFingerprint = Fingerprint(new DomainRecord());
+
+    private void TakeSavedSnapshot()
+    {
+        _savedSnapshot.Clear();
+        foreach (var row in _rows) _savedSnapshot[row] = Fingerprint(row);
+    }
+
+    private bool HasUnsavedChanges => _rows.Any(r =>
+        _savedSnapshot.TryGetValue(r, out var saved) ? saved != Fingerprint(r) : Fingerprint(r) != BlankFingerprint);
+
+    /// <summary>每次 render 完把「有沒有沒存的修改」同步給瀏覽器端的 unsavedGuard（wwwroot/js/unsaved-guard.js），
+    /// 由它攔側邊欄/站內連結並跳 SweetAlert2 確認——這個專案路由不是互動式的，NavigationLock 的
+    /// OnBeforeInternalNavigation 攔不到站內導覽。關分頁、重新整理仍交給 ConfirmExternalNavigation。</summary>
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        _guardSynced = true;
+        try { await JS.InvokeVoidAsync("unsavedGuard.update", HasUnsavedChanges, "這頁有修改還沒按「儲存」，離開的話這些修改會不見。"); }
+        catch (JSDisconnectedException) { }
+    }
+
+    /// <summary>OnAfterRenderAsync 只在互動式渲染時才會跑；預先渲染（prerender）那一份元件也會被
+    /// Dispose，但那時候還不能呼叫 JS，所以只有真的同步過 unsavedGuard 的才需要清。</summary>
+    private bool _guardSynced;
+
+    private void AddRow()
+    {
+        var row = new DomainRecord();
+        _rows.Add(row);
+        _editingRows.Add(row);
+    }
+
+    /// <summary>CommonName 打完（欄位失焦）後，Organization 還空著就依網域自動帶一個猜測值——
+    /// 去掉開頭的 www.（如果有），取第一段當公司簡稱。已經有值就不覆蓋，尊重使用者自己填的。</summary>
+    /// <summary>
+    /// CommonName 打完（欄位失焦）後的處理：
+    /// 1. 這個網域名稱資料庫裡已經有資料（不管現在畫面上看不看得到那筆）——代表使用者是
+    ///    從「新網域」按鈕誤打了一個其實已存在的網域，直接把舊資料（IP/FTP帳密等）整列
+    ///    帶進來，不用使用者自己記、自己重打，避免打錯字把舊的正確資料蓋掉。
+    /// 2. 真的是全新網域——維持原本「Organization 空著就依網域猜一個」的行為。
+    /// </summary>
+    private void AutoFillOrganization(DomainRecord row)
+    {
+        var existing = _rows.FirstOrDefault(r =>
+            !ReferenceEquals(r, row) && string.Equals(r.CommonName, row.CommonName, StringComparison.OrdinalIgnoreCase));
+
+        if (existing is not null)
+        {
+            row.Id = existing.Id;
+            row.Organization = existing.Organization;
+            row.Ip = existing.Ip;
+            row.FtpUser = existing.FtpUser;
+            row.FtpPass = existing.FtpPass;
+            row.FtpFolder = existing.FtpFolder;
+            row.ProductCode = existing.ProductCode;
+            row.Years = existing.Years;
+            row.Locality = existing.Locality;
+            row.Remark = existing.Remark;
+            _saveMessage = $"「{row.CommonName}」資料庫裡已經有資料，已自動帶入既有內容（IP/FTP帳密等），請確認/修改後再存檔。";
+            return;
+        }
+
+        if (!string.IsNullOrWhiteSpace(row.Organization)) return;
+        row.Organization = ExtractOrganization(row.CommonName);
+    }
+
+    private static string ExtractOrganization(string commonName)
+    {
+        var name = commonName.Trim();
+        if (name.Length == 0) return "";
+
+        var labels = name.Split('.');
+        var first = labels[0];
+        if (string.Equals(first, "www", StringComparison.OrdinalIgnoreCase) && labels.Length > 1)
+            return labels[1];
+        return first;
+    }
+
+    private async Task RequestDelete(DomainRecord row)
+    {
+        if (string.IsNullOrWhiteSpace(row.CommonName))
+        {
+            _rows.Remove(row); // 新增但還沒填的空白列，不用確認直接刪
+            EnsureAtLeastOneRow();
+            return;
+        }
+
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            icon = "warning",
+            title = $"確定要刪除「{row.CommonName}」嗎？",
+            text = "會立即從資料庫刪除，無法復原。",
+            confirmText = "確定刪除",
+            danger = true,
+        });
+        if (!confirmed) return;
+
+        DomainRepo.Delete(row.CommonName);
+        _orderMap.Remove(row.CommonName.Trim()); // Delete 連訂單一起刪了，同名重新新增時不能被當成舊網域
+        _pendingRenewalMap.Remove(row.CommonName.Trim());
+        _rows.Remove(row);
+        EnsureAtLeastOneRow();
+    }
+
+    /// <summary>刪到一筆不剩時補一列空白列——表格整個空掉的話畫面上什麼都沒有，看起來像壞掉，
+    /// 使用者也不知道要先按「新增列」。開頁時 OnInitialized 就是同樣的做法，這裡只是接著沿用。</summary>
+    private void EnsureAtLeastOneRow()
+    {
+        if (VisibleRows.Count == 0) AddRow();
+    }
+
+    private Task RequestSave() => RequestConfirmedAction(DoSave, isExport: false);
+
+    private Task RequestExportCsv() => RequestConfirmedAction(() => { DoExportCsv(); return Task.CompletedTask; }, isExport: true);
+
+    private async Task RequestConfirmedAction(Func<Task> action, bool isExport)
+    {
+        var count = CountUnvalidatedOrFailed();
+        if (count > 0)
+        {
+            var label = isExport ? "匯出" : "儲存";
+            var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+            {
+                icon = "warning",
+                title = $"有 {count} 筆尚未通過驗證",
+                text = $"這些網域還沒驗證過，或上次驗證沒通過。仍要{label}嗎？",
+                confirmText = $"仍要{label}",
+            });
+            if (!confirmed) return;
+        }
+        await action();
+    }
+
+    /// <summary>算「未驗證，或上次驗證沒過」的列數——依目前唯一有內容的那份結果（DNS/FTP/CRM 互斥，見上面三個 Run 方法）判斷。</summary>
+    private int CountUnvalidatedOrFailed()
+    {
+        var validRows = VisibleRows.Where(r => !string.IsNullOrWhiteSpace(r.CommonName)).ToList();
+        var count = 0;
+
+        foreach (var row in validRows)
+        {
+            var name = row.CommonName.Trim();
+            bool checkedAtAll = false, passed = false;
+
+            if (_dnsResults is not null)
+            {
+                var match = _dnsResults.FirstOrDefault(d => string.Equals(d.Row.CommonName, name, StringComparison.OrdinalIgnoreCase));
+                if (match is not null) { checkedAtAll = true; passed = match.Status == DnsStatus.Ok; }
+            }
+            else if (_ftpResults.Count > 0)
+            {
+                var match = _ftpResults.FirstOrDefault(f => string.Equals(f.CommonName, name, StringComparison.OrdinalIgnoreCase));
+                if (match is not null) { checkedAtAll = true; passed = match.Outcome == UploadOutcome.Success; }
+            }
+            else if (_crmResults.Count > 0)
+            {
+                var match = _crmResults.FirstOrDefault(c => string.Equals(c.CommonName, name, StringComparison.OrdinalIgnoreCase));
+                if (match is not null) { checkedAtAll = true; passed = match.Outcome == CrmVerifyOutcome.Ok; }
+            }
+
+            if (!checkedAtAll || !passed) count++;
+        }
+
+        return count;
+    }
+
+    /// <summary>
+    /// 存檔當下：發現這個 CommonName 其實已經是 Issued 狀態（例如從「新網域」按鈕誤入，打的
+    /// 其實是舊網域要準備搬機房重簽），或者是重發模式下資料庫完全沒紀錄過的網域，一律標記
+    /// 「正在準備續約/重簽」（存資料庫，不是記憶體）——避免存完之後這筆資料在步驟3、待處理
+    /// 清單全部看不到，卡在哪裡都按不到「免費重簽」。不自動跳頁，存檔後留在這一頁讓使用者
+    /// 看得到完整的存檔結果，自己決定何時前往步驟3。
+    /// </summary>
+    private Task DoSave()
+    {
+        // ★ 只存畫面上實際看得到、使用者這次真的有機會碰到的那幾筆（VisibleRows），
+        // 不能用 _rows——那是這頁載入時撈進來的「全部」網域，混雜著一堆根本沒顯示
+        // 出來、使用者完全沒碰過的舊資料，存下去除了訊息筆數對不上，還會白白動到那些
+        // 沒碰過的資料的 UpdatedAt。SaveAll 是純 upsert（不刪除清單外的既有資料），
+        // 只傳可見子集合是安全的。
+        var visibleRows = VisibleRows.Where(r => !string.IsNullOrWhiteSpace(r.CommonName)).ToList();
+        DomainRepo.SaveAll(visibleRows);
+
+        _pendingRenewalCount = 0;
+
+        foreach (var row in visibleRows)
+        {
+            var order = LatestOrder(row.CommonName);
+            if (order is { Status: "Issued" } || (order is null && IsReissueMode))
+            {
+                DomainRepo.SetPendingRenewal(row.CommonName, true);
+                _pendingRenewalCount++;
+            }
+        }
+        ReloadStatusMaps();
+
+        TakeSavedSnapshot();
+        _saveMessage = $"已儲存 {visibleRows.Count} 筆到資料庫，{DateTime.Now:HH:mm:ss}";
+        return Task.CompletedTask;
+    }
+
+    private void DoExportCsv()
+    {
+        var rows = VisibleRows.Where(r => !string.IsNullOrWhiteSpace(r.CommonName)).ToList();
+        DomainRepo.ExportCsv(rows);
+        _saveMessage = $"已匯出畫面上顯示的 {rows.Count} 筆到 {DomainRepo.CsvPath}，{DateTime.Now:HH:mm:ss}";
+    }
+
+    /// <summary>讀回「匯出畫面上的 CSV」寫的那個固定檔案，依 CommonName 合併進 _rows——
+    /// 同名的覆蓋掉畫面上原本那列，沒有的新增一列。只動畫面狀態，不碰資料庫，使用者確認過
+    /// 內容後還是要自己按「儲存」才會真的寫進去。</summary>
+    private void DoImportCsv()
+    {
+        var imported = DomainRepo.ImportCsv();
+        if (imported.Count == 0)
+        {
+            _saveMessage = $"找不到可匯入的資料（{DomainRepo.CsvPath} 不存在或是空的），{DateTime.Now:HH:mm:ss}";
+            return;
+        }
+
+        // 畫面沒資料時 OnInitialized 會自動加一空白列方便手動輸入，匯入真的資料時這列
+        // 沒有 CommonName 對不上任何匯入資料，只會白白留在清單最上面——匯入前先清掉。
+        _rows.RemoveAll(r => string.IsNullOrWhiteSpace(r.CommonName));
+
+        var added = 0;
+        var updated = 0;
+        foreach (var record in imported)
+        {
+            var existing = _rows.FirstOrDefault(r => string.Equals(r.CommonName, record.CommonName, StringComparison.OrdinalIgnoreCase));
+            if (existing is null)
+            {
+                _rows.Add(record);
+                added++;
+            }
+            else
+            {
+                var index = _rows.IndexOf(existing);
+                _rows[index] = record;
+                _editingRows.Remove(existing);
+                updated++;
+            }
+            _editingRows.Add(record); // 匯入的這幾筆這次頁面存活期間都要維持可見，理由同 AddRow()
+        }
+
+        _page = 1;
+        _saveMessage = $"已匯入 {imported.Count} 筆（新增 {added}、覆蓋 {updated}），記得確認內容後按「儲存」，{DateTime.Now:HH:mm:ss}";
+    }
+
+    private async Task RunFtpCheck()
+    {
+        _ftpChecking = true;
+        _dnsResults = null;
+        _crmResults.Clear();
+        _ftpResults.Clear();
+        try
+        {
+            foreach (var row in VisibleRows.Where(r => !string.IsNullOrWhiteSpace(r.CommonName) && !string.IsNullOrWhiteSpace(r.Ip)))
+            {
+                var result = await Task.Run(() => FtpSvc.Upload(row, testMode: true));
+                _ftpResults.Add(result);
+                StateHasChanged();
+            }
+        }
+        finally
+        {
+            _ftpChecking = false;
+        }
+    }
+
+    private static string FtpOutcomeBadgeClass(UploadOutcome outcome) => outcome switch
+    {
+        UploadOutcome.Success => "text-bg-success",
+        UploadOutcome.Skipped => "text-bg-secondary",
+        _ => "text-bg-danger",
+    };
+
+    private async Task RunDnsCheck()
+    {
+        _checking = true;
+        _crmResults.Clear();
+        _ftpResults.Clear();
+        try
+        {
+            _dnsResults = await DnsCheck.CheckAsync(VisibleRows);
+        }
+        finally
+        {
+            _checking = false;
+        }
+    }
+
+    private async Task RunCrmVerify()
+    {
+        var settings = CrmSettingsRepo.Load();
+        if (string.IsNullOrWhiteSpace(settings.Cookie))
+        {
+            _saveMessage = "尚未設定 CRM Cookie，請先到「CRM 設定」頁面填好。";
+            return;
+        }
+
+        _crmRunning = true;
+        _crmResults.Clear();
+        _dnsResults = null;
+        _ftpResults.Clear();
+        _crmCts = new CancellationTokenSource();
+
+        try
+        {
+            await CrmVerifySvc.VerifyAsync(
+                VisibleRows,
+                targetIdFilter: null,
+                settings.Cookie,
+                settings.BaseUrl,
+                result => InvokeAsync(() =>
+                {
+                    _crmResults.Add(result);
+                    StateHasChanged();
+                }),
+                _crmCts.Token);
+        }
+        finally
+        {
+            _crmRunning = false;
+            StateHasChanged();
+        }
+    }
+
+    private void StopCrmVerify() => _crmCts?.Cancel();
+
+    private static string StatusBadgeClass(DnsStatus status) => status switch
+    {
+        DnsStatus.Ok => "text-bg-success",
+        DnsStatus.OkWwwWarn => "text-bg-warning",
+        DnsStatus.OkWww => "text-bg-warning",
+        DnsStatus.Fail => "text-bg-danger",
+        _ => "text-bg-secondary",
+    };
+
+    /// <summary>整列 Status 已經是 Ok 時一律當作符合（涵蓋 alreadyWww 那種本來就不用比對
+    /// www 的邊界情況），不是 Ok 才看這一欄自己的 match 值。</summary>
+    private static string IpMatchBadgeClass(DnsCheckResult r, bool columnMatch) =>
+        r.Status == DnsStatus.Ok || columnMatch ? "text-bg-success" : "text-bg-danger";
+
+    private static string IpMatchBadgeLabel(DnsCheckResult r, bool columnMatch) =>
+        r.Status == DnsStatus.Ok || columnMatch ? "OK" : "DIFF";
+
+    private static string CrmOutcomeBadgeClass(CrmVerifyOutcome outcome) => outcome switch
+    {
+        CrmVerifyOutcome.Ok => "text-bg-success",
+        CrmVerifyOutcome.Diff => "text-bg-warning",
+        _ => "text-bg-danger",
+    };
+
+    private static string CrmOutcomeLabel(CrmVerifyResult r) => r.Outcome switch
+    {
+        CrmVerifyOutcome.Ok => "通過",
+        CrmVerifyOutcome.Diff => $"不一致：{string.Join(", ", r.Diffs.Select(d => d.Field))}",
+        CrmVerifyOutcome.NotFound => "查無案件",
+        CrmVerifyOutcome.ParseFailed => "解析失敗",
+        CrmVerifyOutcome.LoginRequired => "Cookie 已失效，請至「CRM 設定」更新",
+        _ => "錯誤",
+    };
+
+    public async ValueTask DisposeAsync()
+    {
+        _crmCts?.Cancel();
+        if (!_guardSynced) return;
+        try { await JS.InvokeVoidAsync("unsavedGuard.clear"); }
+        catch (JSDisconnectedException) { }
+    }
+}

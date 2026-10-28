@@ -1,0 +1,502 @@
+@page "/order-status"
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+@using SslWebConsole.Models
+@using SslWebConsole.Services
+@inject DomainRepository DomainRepo
+@inject OrderStatusService OrderStatusSvc
+@inject PlaceOrderService PlaceOrderSvc
+@inject NicSrsConfigLoader ConfigLoader
+@inject CsrService CsrSvc
+@inject CertificateOrderRepository OrderRepo
+@inject ReissueService ReissueSvc
+@inject FlowModeService FlowMode
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+
+<PageTitle>步驟3 · @(IsReissueMode ? "免費重簽／更新" : "下單")</PageTitle>
+
+@if (_batchRunning)
+{
+    <NavigationLock ConfirmExternalNavigation="true" />
+}
+
+<h1 class="h3 mb-1">步驟3 · @(IsReissueMode ? "免費重簽／更新憑證" : "下單")</h1>
+@if (IsReissueMode)
+{
+    <p class="hint mb-4">沿用現有訂閱換發新憑證，不扣款。已下單的網域不會出現在這裡，請到 <a href="/overview">總覽</a> 查看。</p>
+}
+else
+{
+    <p class="hint mb-3">方案（ProductCode）／年數（Years）在步驟1填寫；下單前會先查雲端，避免重複下單。已下單的網域不會出現在這裡，請到 <a href="/overview">總覽</a> 查看。</p>
+
+    <div class="alert alert-danger py-2 mb-4">
+        <strong><i class="bi bi-exclamation-triangle-fill me-1"></i>這一步會真的呼叫 NicSRS 下單扣款。</strong>每次送出前都會跳出確認視窗。
+    </div>
+}
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="section-title"><i class="bi bi-collection me-1"></i>批次@(ActionName)</div>
+        <p class="hint mb-2">逐筆依序送出，單筆失敗不影響其他筆，絕不自動重試。@(IsReissueMode ? "免費，不會扣款。" : "")</p>
+        @if (!IsReissueMode)
+        {
+            <details class="help mb-3">
+                <summary>
+                    <i class="bi bi-sliders me-1"></i>進階選項
+                    @if (_force)
+                    {
+                        <span class="badge text-bg-danger ms-2">已開啟強制下單</span>
+                    }
+                </summary>
+                <div class="row g-3" style="max-width: 560px;">
+                    <div class="col-sm-6">
+                        <label class="form-label small mb-1" for="renewDays" title="既有訂單距到期幾天以內，才視為可以續期下單">到期前幾天可續期</label>
+                        <input class="form-control form-control-sm" id="renewDays" type="number" min="1" @bind="_renewWithinDays" />
+                    </div>
+                    <div class="col-sm-6 d-flex align-items-end">
+                        <div class="form-check">
+                            <input class="form-check-input" type="checkbox" id="forceCheck" @bind="_force" />
+                            <label class="form-check-label small" for="forceCheck">強制下單（跳過本機/雲端查重）</label>
+                        </div>
+                    </div>
+                </div>
+                <p class="hint mb-0 mt-2">驗證方式固定為檔案驗證（HTTP_CSR_HASH），驗證檔由步驟4上傳。</p>
+            </details>
+        }
+        <div class="d-flex gap-2 flex-wrap align-items-center">
+            <button class="btn btn-outline-secondary btn-sm" disabled="@(_busy)" @onclick="SelectAllOrderable">全選可@(ActionName)</button>
+            <button class="btn btn-outline-secondary btn-sm" disabled="@(_busy)" @onclick="() => _selected.Clear()">取消全選</button>
+            @if (IsReissueMode)
+            {
+                <button class="btn btn-primary btn-sm" title="免費，不會扣款" disabled="@(_selected.Count == 0 || _busy)" @onclick="OpenBatchConfirm">
+                    批次重簽（@_selected.Count）
+                </button>
+            }
+            else
+            {
+                <button class="btn btn-danger btn-sm" title="會真的送出付費訂單" disabled="@(_selected.Count == 0 || _busy)" @onclick="OpenBatchConfirm">
+                    批次下單（@_selected.Count，會扣款）
+                </button>
+            }
+            @if (_batchRunning)
+            {
+                <button class="btn btn-outline-danger btn-sm" @onclick="StopBatch">停止批次</button>
+                <span class="text-muted">執行中… @_batchResults.Count / @_batchTotal</span>
+            }
+        </div>
+
+        @if (_batchResults.Count > 0)
+        {
+            var successCount = _batchResults.Count(r => r.Success);
+            var skippedCount = _batchResults.Count(r => !r.Success && r.Skipped);
+            var failedCount = _batchResults.Count(r => !r.Success && !r.Skipped);
+            <div class="mt-3">
+                <div class="fw-semibold mb-2">批次結果：成功 @successCount／略過 @skippedCount／失敗 @failedCount</div>
+                <div class="table-responsive">
+                    <table class="table table-sm">
+                        <thead><tr><th>CommonName</th><th>Result</th><th>Message</th></tr></thead>
+                        <tbody>
+                            @foreach (var r in _batchResults)
+                            {
+                                <tr>
+                                    <td>@r.CommonName</td>
+                                    <td>
+                                        @if (r.Success)
+                                        {
+                                            <span class="badge text-bg-success">成功</span>
+                                        }
+                                        else if (r.Skipped)
+                                        {
+                                            <span class="badge text-bg-secondary">略過</span>
+                                        }
+                                        else
+                                        {
+                                            <span class="badge text-bg-danger">失敗</span>
+                                        }
+                                    </td>
+                                    <td class="hint">@r.Message</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+                @if (failedCount > 0)
+                {
+                    <button class="btn btn-outline-danger btn-sm" disabled="@_busy" @onclick="RetryFailed">重試失敗（@failedCount）</button>
+                }
+            </div>
+        }
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-sm align-middle">
+                <thead>
+                    <tr>
+                        <th></th><th>CommonName</th>
+                        @if (!IsReissueMode)
+                        {
+                            <th>ProductCode</th><th>Years</th>
+                        }
+                        <th>CSR</th><th>Order Status</th><th>Action</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    @foreach (var row in PagedRows)
+                    {
+                        var spec = PlaceOrderService.ResolveOrderSpec(row.ProductCode, row.Years);
+                        var hasCsr = CsrSvc.DomainFolderExists(row.CommonName);
+                        var status = _statuses.GetValueOrDefault(row.CommonName);
+                        var orderStatus = LatestOrder(row.CommonName)?.Status;
+                        var canOrder = spec.IsValid && hasCsr && !_busy;
+                        var canSelect = IsReissueMode || (spec.IsValid && hasCsr && !(status?.HasCertId ?? false));
+                        <tr>
+                            <td>
+                                <input class="form-check-input" type="checkbox" disabled="@(!canSelect || _busy)"
+                                       checked="@_selected.Contains(row.CommonName)"
+                                       @onchange="e => ToggleSelected(row.CommonName, (bool)e.Value!)" />
+                            </td>
+                            <td>@row.CommonName</td>
+                            @if (!IsReissueMode)
+                            {
+                                <td>@row.ProductCode</td>
+                                <td>@row.Years</td>
+                            }
+                            <td>
+                                @if (hasCsr)
+                                {
+                                    <span class="badge text-bg-success">已產生</span>
+                                }
+                                else
+                                {
+                                    <span class="badge text-bg-warning">尚未產生（先做步驟2）</span>
+                                }
+                            </td>
+                            <td>
+                                @if (orderStatus == "Issued")
+                                {
+                                    <span class="badge text-bg-info">本機記錄：已簽發</span>
+                                }
+                                else if (!IsReissueMode && !spec.IsValid)
+                                {
+                                    <span class="badge text-bg-danger" title="@spec.Error">CSV 設定錯誤</span>
+                                }
+                                else if (status is null)
+                                {
+                                    <span class="badge text-bg-secondary">未檢查</span>
+                                }
+                                else if (status.HasCertId)
+                                {
+                                    <span class="badge text-bg-success">已下單 (@status.CertId)</span>
+                                }
+                                else
+                                {
+                                    <span class="badge text-bg-warning">尚未下單</span>
+                                }
+                            </td>
+                            <td class="d-flex gap-2 flex-wrap">
+                                <button class="btn btn-outline-secondary btn-sm" disabled="@_busy" @onclick="() => CheckLocal(row)">重新檢查</button>
+                                <button class="btn btn-outline-secondary btn-sm" disabled="@_busy" @onclick="() => CheckCloud(row)">查詢雲端狀態</button>
+                                @if (IsReissueMode)
+                                {
+                                    <button class="btn btn-outline-primary btn-sm" disabled="@_busy" @onclick="() => Reissue(row)" title="免費，不會扣款">免費重簽</button>
+                                }
+                                else
+                                {
+                                    <button class="btn btn-danger btn-sm" disabled="@(!canOrder)" @onclick="() => PlaceOrder(row)">下單（會扣款）</button>
+                                }
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+            <Pager TotalCount="VisibleRows.Count" PageSize="PageSize" @bind-CurrentPage="_page" />
+        </div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="section-title mb-2"><i class="bi bi-terminal me-1"></i>執行紀錄</div>
+        <div class="log-panel">@string.Join("\n", _log)</div>
+    </div>
+</div>
+
+@code {
+    private List<DomainRecord> _rows = [];
+    private readonly Dictionary<string, OrderStatusInfo> _statuses = new();
+    private readonly List<string> _log = [];
+    private bool _force;
+    private int _renewWithinDays = 30;
+    /// <summary>這套系統只支援檔案驗證：步驟4用 FTP 上傳驗證檔。下單、重簽一律用這個，
+    /// 不再讀公用設定的 DefaultDcvMethod——那邊被改成 DNS/EMAIL 的話步驟4會永遠驗證不過。</summary>
+    private const string DcvMethod = "HTTP_CSR_HASH";
+    private bool _busy;
+
+    private readonly HashSet<string> _selected = new(StringComparer.OrdinalIgnoreCase);
+    private List<string> _pendingBatchDomains = [];
+    private bool _batchRunning;
+    private CancellationTokenSource? _batchCts;
+    private readonly List<OrderPlacementResult> _batchResults = new();
+    private int _batchTotal;
+
+    /// <summary>
+    /// 已下單（Pending/Issued）的網域不用再出現在下單頁——去 /overview 看歷史資料。純看
+    /// 資料庫，不看 .certid 檔案（見 Domains.razor 的 VisibleRows 註解，同樣道理）。
+    /// </summary>
+    private List<DomainRecord> VisibleRows =>
+        _rows.Where(r =>
+            _pendingRenewalMap.GetValueOrDefault(r.CommonName.Trim()) ||
+            LatestOrder(r.CommonName) is null or { Status: "Failed" }
+        ).ToList();
+
+    // ★ 訂單狀態、續約標記一次撈進字典，畫面一律查這裡，不再每一列各查一次資料庫；
+    // 下單/重簽之後（狀態可能變了）才用 ReloadStatusMaps() 重撈。
+    private Dictionary<string, bool> _pendingRenewalMap = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, OrderSummary> _orderMap = new(StringComparer.OrdinalIgnoreCase);
+
+    private OrderSummary? LatestOrder(string commonName) => _orderMap.GetValueOrDefault(commonName.Trim());
+
+    private void ReloadStatusMaps()
+    {
+        _pendingRenewalMap = DomainRepo.LoadPendingRenewalMap();
+        _orderMap = OrderRepo.GetLatestAll();
+    }
+
+    private int _pageSize = 20;
+    private int PageSize => _pageSize;
+    private int _page = 1;
+    private List<DomainRecord> PagedRows => VisibleRows.Skip((_page - 1) * PageSize).Take(PageSize).ToList();
+
+    private bool IsReissueMode => FlowMode.Current == SslWebConsole.Services.FlowMode.Reissue;
+
+    /// <summary>批次卡片、紀錄訊息共用的動作名稱，兩種模式走同一套批次流程只差在這個字。</summary>
+    private string ActionName => IsReissueMode ? "重簽" : "下單";
+
+    protected override void OnInitialized()
+    {
+        if (FlowMode.Current is null) { Nav.NavigateTo("/"); return; }
+
+        _rows = DomainRepo.LoadAll();
+        ReloadStatusMaps();
+        var config = ConfigLoader.Load();
+        _pageSize = config.PageSize;
+    }
+
+    private void AppendLog(string message) => _log.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {message}");
+
+    private void CheckLocal(DomainRecord row) => _statuses[row.CommonName] = OrderStatusSvc.Check(row.CommonName);
+
+    private async Task CheckCloud(DomainRecord row)
+    {
+        _busy = true;
+        try
+        {
+            var existing = await PlaceOrderSvc.CheckExistingOrderAsync(row.CommonName, _renewWithinDays);
+            AppendLog(existing is null
+                ? $"[{row.CommonName}] 雲端查詢：無擋下的有效訂單（可下單，或原本就沒有訂單）。"
+                : $"[{row.CommonName}] 雲端查詢：已有訂單 certId={existing.CertId} status={existing.Status}" +
+                  (existing.DaysLeft is not null ? $"，距到期還 {existing.DaysLeft} 天" : "") + "。");
+        }
+        finally { _busy = false; }
+    }
+
+    private async Task PlaceOrder(DomainRecord row)
+    {
+        var spec = PlaceOrderService.ResolveOrderSpec(row.ProductCode, row.Years);
+        if (!spec.IsValid)
+        {
+            AppendLog($"[{row.CommonName}] 略過：{spec.Error}");
+            return;
+        }
+
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            icon = "warning",
+            title = $"確定要對「{row.CommonName}」下單嗎？",
+            text = $"{spec.ProductCode}，{spec.Years} 年。會真的送出付費訂單並扣款，送出後無法撤回。" + (_force ? "（已開啟強制下單，會跳過查重）" : ""),
+            confirmText = "確定下單",
+            danger = true,
+        });
+        if (!confirmed) return;
+
+        _busy = true;
+        try
+        {
+            var result = await PlaceOrderSvc.PlaceOrderAsync(
+                row.CommonName, spec.ProductCode!, spec.Years!.Value, DcvMethod, _force, _renewWithinDays);
+            AppendLog($"[{row.CommonName}] {(result.Success ? "下單成功" : result.Skipped ? "略過" : "下單失敗")}: {result.Message}");
+            _statuses[row.CommonName] = OrderStatusSvc.Check(row.CommonName);
+            if (result.Success) DomainRepo.SetPendingRenewal(row.CommonName, false);
+            ReloadStatusMaps();
+        }
+        finally { _busy = false; }
+    }
+
+    private async Task Reissue(DomainRecord row)
+    {
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            title = $"要對「{row.CommonName}」做免費重簽／更新憑證嗎？",
+            text = "沒有完整 CSR/私鑰的會重新產生並取代本機現有的，並觸發重新驗證網域（不會扣款）。",
+            confirmText = "確定重簽",
+        });
+        if (!confirmed) return;
+
+        _busy = true;
+        try
+        {
+            var result = await ReissueSvc.ReissueAsync(row.CommonName, DcvMethod);
+            AppendLog($"[{row.CommonName}] {(result.Success ? "重簽成功" : result.Skipped ? "略過" : "重簽失敗")}: {result.Message}");
+            if (result.Success) DomainRepo.SetPendingRenewal(row.CommonName, false);
+            ReloadStatusMaps();
+        }
+        finally { _busy = false; }
+    }
+
+    private void ToggleSelected(string commonName, bool isChecked)
+    {
+        if (isChecked) _selected.Add(commonName);
+        else _selected.Remove(commonName);
+    }
+
+    /// <summary>重簽模式清單上每一筆都能重簽（CSR 缺了 ReissueService 會自己補、年期用完
+    /// 由 /ssl/replace 把關），所以全選就是整份清單；下單模式才需要檢查 CSV 設定/CSR/是否已下單。</summary>
+    private void SelectAllOrderable()
+    {
+        foreach (var row in VisibleRows)
+        {
+            if (IsReissueMode)
+            {
+                _selected.Add(row.CommonName);
+                continue;
+            }
+
+            var spec = PlaceOrderService.ResolveOrderSpec(row.ProductCode, row.Years);
+            var hasCsr = CsrSvc.DomainFolderExists(row.CommonName);
+            var status = _statuses.GetValueOrDefault(row.CommonName);
+            var isReissueRow = LatestOrder(row.CommonName)?.Status == "Issued";
+            if (spec.IsValid && hasCsr && !isReissueRow && !(status?.HasCertId ?? false))
+                _selected.Add(row.CommonName);
+        }
+    }
+
+    /// <summary>批次送出前的最後確認：跟刪除網域一樣用彈出式對話框（appDialog），列出這次
+    /// 真的要送出的網域——批次是照勾選清單送的，勾選可能是「全選」自動帶的，送出前要再看一眼。
+    /// 下單會扣款且無法撤回，所以下單模式用紅色按鈕；重簽免費但會重新產生 CSR、觸發重新驗證。</summary>
+    private async Task OpenBatchConfirm()
+    {
+        _pendingBatchDomains = _selected.ToList();
+        if (_pendingBatchDomains.Count == 0) return;
+
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            icon = "warning",
+            title = IsReissueMode
+                ? $"確定要對 {_pendingBatchDomains.Count} 個網域免費重簽嗎？"
+                : $"確定要對 {_pendingBatchDomains.Count} 個網域下單嗎？",
+            text = IsReissueMode
+                ? "不會扣款。沒有完整 CSR/私鑰的會重新產生並取代本機現有的，並觸發重新驗證網域。"
+                : "會真的送出付費訂單並扣款，送出後無法撤回。",
+            items = _pendingBatchDomains,
+            confirmText = IsReissueMode ? "確定重簽" : "確定下單",
+            danger = !IsReissueMode,
+        });
+        if (!confirmed) return;
+
+        await StartBatch();
+    }
+
+    private async Task StartBatch()
+    {
+        _batchRunning = true;
+        _busy = true;
+        _batchResults.Clear();
+        _batchCts = new CancellationTokenSource();
+        var domains = _pendingBatchDomains;
+        _batchTotal = domains.Count;
+
+        try
+        {
+            foreach (var commonName in domains)
+            {
+                if (_batchCts.Token.IsCancellationRequested) break;
+
+                var row = _rows.FirstOrDefault(r => string.Equals(r.CommonName, commonName, StringComparison.OrdinalIgnoreCase));
+                if (row is null) continue;
+
+                var result = IsReissueMode
+                    ? await ReissueSvc.ReissueAsync(commonName, DcvMethod)
+                    : await PlaceOrderRowAsync(row);
+                if (result.Success) DomainRepo.SetPendingRenewal(commonName, false);
+                ReloadStatusMaps();
+
+                _batchResults.Add(result);
+                _selected.Remove(commonName);
+                AppendLog($"[{commonName}] {(result.Success ? $"{ActionName}成功" : result.Skipped ? "略過" : $"{ActionName}失敗")}: {result.Message}");
+                StateHasChanged();
+
+                if (!_batchCts.Token.IsCancellationRequested)
+                {
+                    try { await Task.Delay(1000, _batchCts.Token); }
+                    catch (OperationCanceledException) { }
+                }
+            }
+        }
+        finally
+        {
+            _batchRunning = false;
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    /// <summary>批次下單的單筆：CSV 設定錯誤直接記為略過，不送 API。</summary>
+    private async Task<OrderPlacementResult> PlaceOrderRowAsync(DomainRecord row)
+    {
+        var spec = PlaceOrderService.ResolveOrderSpec(row.ProductCode, row.Years);
+        if (!spec.IsValid)
+            return new OrderPlacementResult(row.CommonName, false, true, spec.Error ?? "設定錯誤");
+
+        var result = await PlaceOrderSvc.PlaceOrderAsync(
+            row.CommonName, spec.ProductCode!, spec.Years!.Value, DcvMethod, _force, _renewWithinDays);
+        _statuses[row.CommonName] = OrderStatusSvc.Check(row.CommonName);
+        return result;
+    }
+
+    private void StopBatch() => _batchCts?.Cancel();
+
+    /// <summary>
+    /// 批次下單/重簽還在跑的時候，把「要攔」同步給瀏覽器端的 unsavedGuard（wwwroot/js/unsaved-guard.js），
+    /// 點側邊欄/站內連結會先跳 SweetAlert2 確認——這個專案路由不是互動式的，NavigationLock 的
+    /// OnBeforeInternalNavigation 攔不到站內導覽。使用者確定離開的話頁面會被 Dispose，
+    /// 由 DisposeAsync 取消掉還沒送出的那幾筆（已經送出的不會撤銷，結果照樣算數）。
+    /// </summary>
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        _guardSynced = true;
+        try { await JS.InvokeVoidAsync("unsavedGuard.update", _batchRunning, $"批次{ActionName}還在執行中，離開的話還沒送出的會停止（已經送出的不會被撤銷）。"); }
+        catch (JSDisconnectedException) { }
+    }
+
+    /// <summary>OnAfterRenderAsync 只在互動式渲染時才會跑；預先渲染（prerender）那一份元件也會被
+    /// Dispose，但那時候還不能呼叫 JS，所以只有真的同步過 unsavedGuard 的才需要清。</summary>
+    private bool _guardSynced;
+
+    public async ValueTask DisposeAsync()
+    {
+        _batchCts?.Cancel();
+        if (!_guardSynced) return;
+        try { await JS.InvokeVoidAsync("unsavedGuard.clear"); }
+        catch (JSDisconnectedException) { }
+    }
+
+    private void RetryFailed()
+    {
+        foreach (var r in _batchResults.Where(r => !r.Success && !r.Skipped))
+            _selected.Add(r.CommonName);
+    }
+}

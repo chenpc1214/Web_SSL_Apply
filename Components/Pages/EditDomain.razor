@@ -1,0 +1,159 @@
+@page "/domains/edit/{CommonName}"
+@rendermode InteractiveServer
+@using SslWebConsole.Models
+@using SslWebConsole.Services
+@inject DomainRepository DomainRepo
+@inject LocalityRepository LocalityRepo
+@inject CertificateOrderRepository OrderRepo
+@inject CertificateFileRepository FileRepo
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+
+<PageTitle>編輯網域</PageTitle>
+
+<h1 class="h3 mb-1">編輯網域</h1>
+<p class="hint mb-4">修改已下過單的網域資料，按「儲存」直接寫回資料庫。</p>
+
+@if (_row is null)
+{
+    <div class="alert alert-warning">找不到網域「@CommonName」。</div>
+    <button class="btn btn-outline-secondary" @onclick="BackToOverview">回總覽</button>
+}
+else
+{
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="section-title"><i class="bi bi-info-circle me-1"></i>目前狀態</div>
+            <p class="hint">
+                下單：@(_orderSummary is null ? "未下單" : $"{_orderSummary.Status}" + (string.IsNullOrWhiteSpace(_orderSummary.CertId) ? "" : $"（{_orderSummary.CertId}）"))
+                PFX：@(_fileSummary is null ? "尚未打包" : $"已於 {_fileSummary!.GeneratedAt:yyyy-MM-dd} 完成")
+            </p>
+        </div>
+    </div>
+
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="row g-3">
+                <div class="col-md-3">
+                    <label class="form-label">ID</label>
+                    <input class="form-control" @bind="_row.Id" />
+                </div>
+                <div class="col-md-5">
+                    <label class="form-label">CommonName</label>
+                    <input class="form-control" value="@_row.CommonName" disabled />
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Organization</label>
+                    <input class="form-control" @bind="_row.Organization" />
+                </div>
+
+                <div class="col-md-4">
+                    <label class="form-label">IP</label>
+                    <input class="form-control" @bind="_row.Ip" />
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">FtpUser</label>
+                    <input class="form-control" @bind="_row.FtpUser" />
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">FtpPass</label>
+                    <input class="form-control" type="text" @bind="_row.FtpPass" />
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">FtpFolder</label>
+                    <input class="form-control" @bind="_row.FtpFolder" />
+                </div>
+
+                <div class="col-md-4">
+                    <label class="form-label" title="僅下單需要，免費重簽可留空">ProductCode</label>
+                    <select class="form-select" @bind="_row.ProductCode">
+                        <option value="">（未選）</option>
+                        @foreach (var productCode in PlaceOrderService.AllowedProductCodes)
+                        {
+                            <option value="@productCode">@productCode</option>
+                        }
+                    </select>
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label" title="僅下單需要，免費重簽可留空">Years</label>
+                    <select class="form-select" @bind="_row.Years">
+                        <option value="">（未選）</option>
+                        @for (var y = 1; y <= 5; y++)
+                        {
+                            <option value="@y">@y</option>
+                        }
+                    </select>
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Locality</label>
+                    <select class="form-select" @bind="_row.Locality">
+                        <option value="">（未選）</option>
+                        @foreach (var locality in _localities)
+                        {
+                            <option value="@locality.Name">@locality.DisplayLabel</option>
+                        }
+                    </select>
+                </div>
+
+            </div>
+        </div>
+    </div>
+
+    <div class="d-flex gap-2 align-items-center">
+        <button class="btn btn-primary" @onclick="Save">儲存</button>
+        <button class="btn btn-outline-secondary" @onclick="BackToOverview">回總覽</button>
+        <button class="btn btn-outline-danger ms-auto" @onclick="RequestDelete">刪除這個網域</button>
+        @if (!string.IsNullOrEmpty(_message))
+        {
+            <span class="hint">@_message</span>
+        }
+    </div>
+}
+
+@code {
+    [Parameter] public string CommonName { get; set; } = "";
+
+    private DomainRecord? _row;
+    private List<LocalityOption> _localities = [];
+    private OrderSummary? _orderSummary;
+    private CertFileSummary? _fileSummary;
+    private string _message = "";
+
+    protected override void OnInitialized()
+    {
+        _localities = LocalityRepo.GetAllOptions();
+        _row = DomainRepo.LoadAll().FirstOrDefault(d => string.Equals(d.CommonName, CommonName, StringComparison.OrdinalIgnoreCase));
+        if (_row is not null)
+        {
+            _orderSummary = OrderRepo.GetLatest(CommonName);
+            _fileSummary = FileRepo.GetByDomain(CommonName);
+        }
+    }
+
+    private void Save()
+    {
+        if (_row is null) return;
+        DomainRepo.SaveAll([_row]);
+        _message = $"已儲存，{DateTime.Now:HH:mm:ss}";
+    }
+
+    private async Task RequestDelete()
+    {
+        if (_row is null) return;
+
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            icon = "warning",
+            title = $"確定要刪除「{_row.CommonName}」嗎？",
+            text = "這會連同這個網域的資料一起從資料庫移除，無法復原。",
+            confirmText = "確定刪除",
+            danger = true,
+        });
+        if (!confirmed) return;
+
+        DomainRepo.Delete(_row.CommonName);
+        Nav.NavigateTo("/overview");
+    }
+
+    private void BackToOverview() => Nav.NavigateTo("/overview");
+}

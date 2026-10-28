@@ -1,0 +1,166 @@
+@rendermode InteractiveServer
+@implements IDisposable
+@using SslWebConsole.Services
+@inject FlowModeService FlowMode
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+
+<div class="nav-shell vh-100 @(IsCollapsed ? "collapsed" : null)">
+    <div class="d-flex align-items-center gap-2 px-2 pt-3 mb-3">
+        <button type="button" class="btn btn-sm nav-toggle" @onclick="ToggleCollapsed"
+                title="@(IsCollapsed ? "展開選單" : "收合選單")" aria-label="@(IsCollapsed ? "展開選單" : "收合選單")"
+                aria-expanded="@(IsCollapsed ? "false" : "true")">
+            <svg width="20" height="20" viewBox="0 0 20 20" aria-hidden="true">
+                <path d="M3 5h14M3 10h14M3 15h14" stroke="currentColor" stroke-width="2" stroke-linecap="round" />
+            </svg>
+        </button>
+        <span class="nav-title"><i class="bi bi-shield-lock me-1"></i>SSL 憑證申請自動化</span>
+    </div>
+
+    <div class="nav-body d-flex flex-column px-3 pb-3">
+        <ul class="nav nav-pills flex-column mb-2">
+            <li class="nav-item">
+                <NavLink class="nav-link" href="/crm-verify"><i class="bi bi-search me-2"></i>CRM 設定</NavLink>
+            </li>
+            <li class="nav-item">
+                <NavLink class="nav-link" href="/settings"><i class="bi bi-gear me-2"></i>公用設定</NavLink>
+            </li>
+            <li class="nav-item">
+                <NavLink class="nav-link" href="/overview"><i class="bi bi-grid me-2"></i>總覽</NavLink>
+            </li>
+        </ul>
+        <hr />
+
+        @if (FlowMode.Current is null)
+        {
+            <p class="hint px-2" style="font-size:0.8rem;">尚未選擇模式，請先到<a href="/overview">總覽</a>選「續約」或「重發/更新」才能開始。</p>
+        }
+        else
+        {
+            <div class="px-2" style="font-size:0.8rem;">
+                <div class="d-flex align-items-center gap-1">
+                    <span class="hint">目前模式：</span>
+                    <span class="mode-chip">@(FlowMode.Current == SslWebConsole.Services.FlowMode.Renew ? "續約" : "重發/更新")</span>
+                    @if (!IsSwitchLocked)
+                    {
+                        <button class="btn btn-link p-0 align-baseline" style="font-size:0.8rem;" @onclick="ConfirmSwitch">切換</button>
+                    }
+                </div>
+                @if (IsSwitchLocked)
+                {
+                    <div class="hint" style="font-size:0.7rem;">已進入步驟3，不能切換</div>
+                }
+            </div>
+        }
+
+        <ul class="nav nav-pills flex-column mb-auto">
+            @{ var enabled = FlowMode.Current is not null; }
+            <li class="nav-item d-flex align-items-center">
+                <span class="step-num me-2">1</span>
+                @if (enabled)
+                {
+                    <NavLink class="nav-link flex-fill" href="/domains">CSV 輸入 / DNS 驗證</NavLink>
+                }
+                else
+                {
+                    <span class="nav-link flex-fill disabled text-muted">CSV 輸入 / DNS 驗證</span>
+                }
+            </li>
+            <li class="nav-item d-flex align-items-center">
+                <span class="step-num me-2">2</span>
+                @if (enabled)
+                {
+                    <NavLink class="nav-link flex-fill" href="/csr">建立 CSR / Key</NavLink>
+                }
+                else
+                {
+                    <span class="nav-link flex-fill disabled text-muted">建立 CSR / Key</span>
+                }
+            </li>
+            <li class="nav-item d-flex align-items-center">
+                <span class="step-num me-2">3</span>
+                @if (enabled)
+                {
+                    <NavLink class="nav-link flex-fill" href="/order-status">@Step3Label</NavLink>
+                }
+                else
+                {
+                    <span class="nav-link flex-fill disabled text-muted">@Step3Label</span>
+                }
+            </li>
+            <li class="nav-item d-flex align-items-center">
+                <span class="step-num me-2">4</span>
+                @if (enabled)
+                {
+                    <NavLink class="nav-link flex-fill" href="/webconfig-upload">web.config 放行 / 上傳驗證檔</NavLink>
+                }
+                else
+                {
+                    <span class="nav-link flex-fill disabled text-muted">web.config 放行 / 上傳驗證檔</span>
+                }
+            </li>
+            <li class="nav-item d-flex align-items-center">
+                <span class="step-num me-2">5</span>
+                @if (enabled)
+                {
+                    <NavLink class="nav-link flex-fill" href="/collect-cert">等待簽發</NavLink>
+                }
+                else
+                {
+                    <span class="nav-link flex-fill disabled text-muted">等待簽發</span>
+                }
+            </li>
+            <li class="nav-item d-flex align-items-center">
+                <span class="step-num me-2">6</span>
+                @if (enabled)
+                {
+                    <NavLink class="nav-link flex-fill" href="/certificates">整理清單 / 打包 PFX</NavLink>
+                }
+                else
+                {
+                    <span class="nav-link flex-fill disabled text-muted">整理清單 / 打包 PFX</span>
+                }
+            </li>
+        </ul>
+    </div>
+</div>
+
+@code {
+    /// <summary>進入步驟3（下單）以後就真的可能有付費/實際 API 動作發生了，「切換」整個
+    /// 關閉（純文字，不能點）——步驟1、2還只是準備資料，不算危險，維持可以切換。
+    /// NavMenu 是 Layout 的一部分，換頁不會重新建立這個元件，要自己訂閱 LocationChanged
+    /// 才會跟著目前網址即時更新，不然這裡永遠停在第一次載入時的路徑。</summary>
+    private static readonly string[] LockedPaths = ["order-status", "webconfig-upload", "collect-cert", "certificates"];
+
+    private bool IsSwitchLocked => LockedPaths.Contains(Nav.ToBaseRelativePath(Nav.Uri).TrimEnd('/'));
+
+    /// <summary>重發/更新走免費的 /ssl/replace，不會扣款，不能沿用續約的「★ 會扣款」字樣嚇到人。</summary>
+    private string Step3Label => FlowMode.Current == SslWebConsole.Services.FlowMode.Reissue ? "免費重簽／更新" : "下單（會扣款）";
+
+    /// <summary>漢堡鈕收合狀態：預設展開；收合時面板往左縮成只剩漢堡鈕的窄條，
+    /// 不是整個消失，這樣使用者隨時點得到按鈕把它叫回來。</summary>
+    private bool IsCollapsed;
+
+    private void ToggleCollapsed() => IsCollapsed = !IsCollapsed;
+
+    protected override void OnInitialized() => Nav.LocationChanged += OnLocationChanged;
+
+    private void OnLocationChanged(object? sender, Microsoft.AspNetCore.Components.Routing.LocationChangedEventArgs e) =>
+        InvokeAsync(StateHasChanged);
+
+    /// <summary>「切換」不是單純的連結——先跳原生 confirm 擋一下手滑誤點，確定要換模式
+    /// 才真的導去總覽；目前正在做的事（例如步驟1填到一半還沒存檔）不會被誤觸打斷。</summary>
+    private async Task ConfirmSwitch()
+    {
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            title = "要去總覽切換模式嗎？",
+            text = "已經下過的訂單不會受影響，只是畫面顯示的模式要重新選。",
+            confirmText = "前往總覽",
+        });
+        // 走 unsavedGuard 而不是 Nav.NavigateTo：目前頁面有沒存的修改（例如步驟1）時會再問一次，不會直接被帶走
+        if (confirmed) await JS.InvokeVoidAsync("unsavedGuard.navigate", "/overview");
+    }
+
+    public void Dispose() => Nav.LocationChanged -= OnLocationChanged;
+}

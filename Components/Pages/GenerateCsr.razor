@@ -1,0 +1,154 @@
+@page "/csr"
+@rendermode InteractiveServer
+@using SslWebConsole.Models
+@using SslWebConsole.Services
+@inject DomainRepository DomainRepo
+@inject CsrService CsrSvc
+@inject CertificateOrderRepository OrderRepo
+@inject NicSrsConfigLoader ConfigLoader
+@inject FlowModeService FlowMode
+@inject NavigationManager Nav
+@inject IJSRuntime JS
+
+<PageTitle>步驟2 · 建立 CSR / Key</PageTitle>
+
+<h1 class="h3 mb-1">步驟2 · 建立 CSR / Key</h1>
+<p class="hint mb-1">產生私鑰和 CSR。只顯示尚未下單或訂單失敗的網域；已下單的請到 <a href="/overview">總覽</a> 查看。</p>
+<details class="help mb-4">
+    <summary><i class="bi bi-info-circle me-1"></i>說明</summary>
+    <p class="hint mb-0">網域資料夾已經存在時不會覆蓋，要重新產生請先按「刪除並重新開始」。「批次產生」會處理清單上全部的網域（不只這一頁），已經有資料夾的會直接跳過。</p>
+</details>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <button class="btn btn-primary" disabled="@_busy" @onclick="GenerateAll" title="處理清單上全部的網域（不只這一頁），已經有資料夾的會跳過">批次產生 CSR</button>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-sm align-middle">
+                <thead>
+                    <tr><th>CommonName</th><th>Organization</th><th>Locality</th><th>Status</th><th></th></tr>
+                </thead>
+                <tbody>
+                    @foreach (var row in PagedRows)
+                    {
+                        var state = _states.GetValueOrDefault(row.CommonName);
+                        <tr>
+                            <td>@row.CommonName</td>
+                            <td>@row.Organization</td>
+                            <td>@row.Locality</td>
+                            <td>
+                                @if (state is null)
+                                {
+                                    <span class="badge @(CsrSvc.DomainFolderExists(row.CommonName) ? "text-bg-warning" : "text-bg-secondary")">
+                                        @(CsrSvc.DomainFolderExists(row.CommonName) ? "資料夾已存在" : "尚未產生")
+                                    </span>
+                                }
+                                else
+                                {
+                                    <span class="badge @(state.Success ? "text-bg-success" : "text-bg-danger")">@state.Message</span>
+                                }
+                            </td>
+                            <td class="d-flex gap-2">
+                                <button class="btn btn-outline-primary btn-sm" @onclick="() => Generate(row)" disabled="@_busy">產生 CSR</button>
+                                <button class="btn btn-outline-danger btn-sm" @onclick="() => DeleteAndRestart(row)" disabled="@(_busy || !CsrSvc.DomainFolderExists(row.CommonName))">刪除並重新開始</button>
+                            </td>
+                        </tr>
+                    }
+                </tbody>
+            </table>
+            <Pager TotalCount="VisibleRows.Count" PageSize="PageSize" @bind-CurrentPage="_page" />
+        </div>
+    </div>
+</div>
+
+@code {
+    private List<DomainRecord> _rows = [];
+    private readonly Dictionary<string, CsrResult> _states = new();
+    private bool _busy;
+
+    protected override void OnInitialized()
+    {
+        if (FlowMode.Current is null) { Nav.NavigateTo("/"); return; }
+
+        _rows = DomainRepo.LoadAll();
+        var pendingRenewalMap = DomainRepo.LoadPendingRenewalMap();
+        var orderMap = OrderRepo.GetLatestAll();
+        _visibleRows = _rows.Where(r =>
+            pendingRenewalMap.GetValueOrDefault(r.CommonName.Trim()) ||
+            orderMap.GetValueOrDefault(r.CommonName.Trim()) is null or { Status: "Failed" }
+        ).ToList();
+        _pageSize = ConfigLoader.Load().PageSize;
+    }
+
+    /// <summary>跟 /domains、/order-status 同一套規則：只看資料庫，不看檔案。這頁產生/刪除 CSR
+    /// 不會改變訂單或續約標記，所以載入時算一次就好，不用每次重繪都查資料庫。</summary>
+    private List<DomainRecord> _visibleRows = [];
+    private List<DomainRecord> VisibleRows => _visibleRows;
+
+    private int _pageSize = 20;
+    private int PageSize => _pageSize;
+    private int _page = 1;
+    private List<DomainRecord> PagedRows => VisibleRows.Skip((_page - 1) * PageSize).Take(PageSize).ToList();
+
+    private Task<CsrResult> GenerateOne(DomainRecord row) => CsrSvc.GenerateAsync(
+        row.CommonName,
+        string.IsNullOrWhiteSpace(row.Organization) ? "IT" : row.Organization,
+        organizationalUnit: "IT",
+        locality: row.Locality,
+        state: row.Locality,
+        country: "TW");
+
+    private async Task Generate(DomainRecord row)
+    {
+        _busy = true;
+        try
+        {
+            _states[row.CommonName] = await GenerateOne(row);
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    /// <summary>依序處理 VisibleRows 全部（不只當頁），資料夾已存在的直接跳過——CSR 產生
+    /// 本來就拒絕覆蓋既有資料夾，跳過而不是報錯比較符合「批次」的直覺（不會因為其中幾筆
+    /// 已經產生過就卡住整批）。每筆處理完立即更新畫面，不用等全部跑完才看到結果。</summary>
+    private async Task GenerateAll()
+    {
+        _busy = true;
+        try
+        {
+            foreach (var row in VisibleRows)
+            {
+                if (CsrSvc.DomainFolderExists(row.CommonName)) continue;
+                _states[row.CommonName] = await GenerateOne(row);
+                StateHasChanged();
+            }
+        }
+        finally
+        {
+            _busy = false;
+        }
+    }
+
+    private async Task DeleteAndRestart(DomainRecord row)
+    {
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            icon = "warning",
+            title = $"確定要刪除「{row.CommonName}」已產生的 CSR/私鑰嗎？",
+            text = "資料夾裡的私鑰跟 CSR 會被刪除，無法復原，要重新產生一份。",
+            confirmText = "刪除並重新開始",
+            danger = true,
+        });
+        if (!confirmed) return;
+
+        CsrSvc.DeleteAndRestart(row.CommonName);
+        _states.Remove(row.CommonName);
+    }
+}

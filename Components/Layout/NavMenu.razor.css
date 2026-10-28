@@ -1,0 +1,52 @@
+/* 面板寬度用 transition 做「往左收」的動畫；收合後留 52px 窄條放漢堡鈕。
+   sticky + 一個視窗高：頁面內容比視窗長、往下捲時側邊欄固定在畫面上不會被捲走留白，
+   選單本身比視窗長時在面板裡自己捲。 */
+.nav-shell {
+    flex-shrink: 0;
+    width: 260px;
+    position: sticky;
+    top: 0;
+    align-self: flex-start;
+    overflow-x: hidden;
+    overflow-y: auto;
+    background-color: #dcf0fb;
+    border-right: 1px solid #c3e3f6;
+    transition: width 0.2s ease;
+}
+
+    .nav-shell.collapsed {
+        width: 52px;
+    }
+
+/* 內容固定 260px 寬，收合動畫過程中文字不會被擠到換行亂跳 */
+.nav-body {
+    width: 260px;
+    transition: opacity 0.15s ease, visibility 0.15s;
+}
+
+.nav-title {
+    white-space: nowrap;
+    transition: opacity 0.15s ease, visibility 0.15s;
+}
+
+/* visibility: hidden 讓收起來的連結不能被 Tab 鍵聚焦到 */
+.nav-shell.collapsed .nav-body,
+.nav-shell.collapsed .nav-title {
+    opacity: 0;
+    visibility: hidden;
+}
+
+.nav-toggle {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    color: var(--bs-body-color);
+}
+
+    .nav-toggle:hover {
+        background-color: rgba(255, 255, 255, 0.7);
+    }

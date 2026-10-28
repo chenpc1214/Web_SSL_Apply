@@ -1,0 +1,19 @@
+# 編譯產出
+bin/
+obj/
+
+# Visual Studio 個人設定與暫存
+.vs/
+*.user
+*.suo
+
+# 資料庫（含客戶資料與加密過的密碼，不進版控）
+*.db
+*.db-shm
+*.db-wal
+
+# 憑證與私鑰，以防誤放進專案資料夾
+*.key
+*.pfx
+*.crt
+*.csr

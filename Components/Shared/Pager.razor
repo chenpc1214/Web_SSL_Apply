@@ -1,0 +1,18 @@
+@if (TotalCount > PageSize)
+{
+    var totalPages = (int)Math.Ceiling(TotalCount / (double)PageSize);
+    <nav class="d-flex align-items-center gap-2 mt-2">
+        <button class="btn btn-outline-secondary btn-sm" disabled="@(CurrentPage <= 1)" @onclick="() => Go(CurrentPage - 1)">‹ 上一頁</button>
+        <span class="hint">第 @CurrentPage / @totalPages 頁（共 @TotalCount 筆）</span>
+        <button class="btn btn-outline-secondary btn-sm" disabled="@(CurrentPage >= totalPages)" @onclick="() => Go(CurrentPage + 1)">下一頁 ›</button>
+    </nav>
+}
+
+@code {
+    [Parameter] public int TotalCount { get; set; }
+    [Parameter] public int PageSize { get; set; } = 20;
+    [Parameter] public int CurrentPage { get; set; } = 1;
+    [Parameter] public EventCallback<int> CurrentPageChanged { get; set; }
+
+    private Task Go(int page) => CurrentPageChanged.InvokeAsync(page);
+}

@@ -1,0 +1,96 @@
+@page "/"
+@page "/crm-verify"
+@rendermode InteractiveServer
+@using SslWebConsole.Services
+@inject CrmSettingsRepository CrmSettingsRepo
+@inject CrmVerifyService CrmVerifySvc
+
+<PageTitle>CRM 設定</PageTitle>
+
+<h1 class="h3 mb-1">CRM 設定</h1>
+<p class="hint mb-4">這裡只管理登入用的 Cookie；設定好之後到 <a href="/domains">步驟1</a> 按「CRM 校對」。</p>
+
+<div class="card mb-4">
+    <div class="card-body">
+        <div class="section-title"><i class="bi bi-key me-1"></i>登入 Cookie</div>
+        <p class="hint">CRM 登入頁有 reCAPTCHA，沒辦法自動登入。瀏覽器登入 <code>@_baseUrl</code> 後，F12 → Application → Cookies，
+            把 <code>ASP.NET_SessionId</code> 與 <code>admin_userInfo</code> 兩個值分別貼進下面兩欄。</p>
+
+        <div class="row g-2 align-items-end">
+            <div class="col-md-4">
+                <label class="form-label">ASP.NET_SessionId</label>
+                <input class="form-control" type="@(_showCookie ? "text" : "password")" @bind="_sessionId" />
+            </div>
+            <div class="col-md-4">
+                <label class="form-label">admin_userInfo</label>
+                <input class="form-control" type="@(_showCookie ? "text" : "password")" @bind="_adminUserInfo" />
+            </div>
+            <div class="col-md-2">
+                <label class="form-label">Base URL</label>
+                <input class="form-control" @bind="_baseUrl" />
+            </div>
+            <div class="col-md-2 d-flex gap-2">
+                <button class="btn btn-outline-secondary" type="button" @onclick="() => _showCookie = !_showCookie">@(_showCookie ? "隱藏" : "顯示")</button>
+                <button class="btn btn-primary" @onclick="SaveCookie">更新</button>
+            </div>
+        </div>
+        <div class="d-flex align-items-center gap-2 mt-2">
+            <button class="btn btn-outline-secondary btn-sm" @onclick="TestLogin" disabled="@_busy">測試 Cookie</button>
+            @if (!string.IsNullOrEmpty(_loginTestMessage))
+            {
+                <span class="hint">@_loginTestMessage</span>
+            }
+        </div>
+    </div>
+</div>
+
+@code {
+    private string _sessionId = "";
+    private string _adminUserInfo = "";
+    private string _baseUrl = "https://work.eztrust.tw";
+    private bool _showCookie = true;
+    private bool _busy;
+    private string _loginTestMessage = "";
+
+    private string ComposedCookie => $"ASP.NET_SessionId={_sessionId}; admin_userInfo={_adminUserInfo}";
+
+    protected override void OnInitialized()
+    {
+        var settings = CrmSettingsRepo.Load();
+        _baseUrl = settings.BaseUrl;
+        (_sessionId, _adminUserInfo) = SplitCookie(settings.Cookie);
+    }
+
+    private static (string SessionId, string AdminUserInfo) SplitCookie(string cookie)
+    {
+        string sessionId = "", adminUserInfo = "";
+        foreach (var part in cookie.Split(';'))
+        {
+            var kv = part.Trim();
+            var idx = kv.IndexOf('=');
+            if (idx < 1) continue;
+            var name = kv[..idx].Trim();
+            var value = kv[(idx + 1)..].Trim();
+            if (string.Equals(name, "ASP.NET_SessionId", StringComparison.OrdinalIgnoreCase)) sessionId = value;
+            else if (string.Equals(name, "admin_userInfo", StringComparison.OrdinalIgnoreCase)) adminUserInfo = value;
+        }
+        return (sessionId, adminUserInfo);
+    }
+
+    private void SaveCookie()
+    {
+        CrmSettingsRepo.Save(ComposedCookie, _baseUrl);
+        _loginTestMessage = $"已儲存，{DateTime.Now:HH:mm:ss}";
+    }
+
+    private async Task TestLogin()
+    {
+        _busy = true;
+        try
+        {
+            var (ok, message) = await CrmVerifySvc.TestLoginAsync(ComposedCookie, _baseUrl, CancellationToken.None);
+            _loginTestMessage = message;
+        }
+        finally { _busy = false; }
+    }
+}
