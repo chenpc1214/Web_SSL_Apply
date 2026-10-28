@@ -30,97 +30,120 @@
         </ul>
         <hr />
 
-        @if (CurrentMode is not { } mode)
+        @if (IsManual)
         {
-            <p class="hint px-2 mb-3" style="font-size:0.8rem;">尚未選擇模式，請先到<a href="/overview">總覽</a>選「續約」或「重發/更新」才能開始。</p>
-        }
-        else
-        {
+            @* 其他憑證商（人工模式）：沒有下單和等待簽發，步驟重新編號為 1~5。 *@
             <div class="px-2 mb-3" style="font-size:0.8rem;">
                 <div class="d-flex align-items-center gap-1">
                     <span class="hint">目前模式：</span>
-                    <span class="mode-chip">@FlowModeRoute.DisplayName(mode)</span>
-                    @if (!IsSwitchLocked)
+                    <span class="mode-chip">其他憑證商</span>
+                    <button class="btn btn-link p-0 align-baseline" style="font-size:0.8rem;" @onclick="ConfirmSwitch">切換</button>
+                </div>
+            </div>
+            <ul class="nav nav-pills flex-column mb-auto">
+                @foreach (var (num, step, label) in ManualSteps)
+                {
+                    <li class="nav-item d-flex align-items-center">
+                        <span class="step-num me-2">@num</span>
+                        <NavLink class="nav-link flex-fill" href="@($"/manual/{step}")">@label</NavLink>
+                    </li>
+                }
+            </ul>
+        }
+        else
+        {
+            if (CurrentMode is not { } mode)
+            {
+                <p class="hint px-2 mb-3" style="font-size:0.8rem;">尚未選擇模式，請先到<a href="/overview">總覽</a>選「續約」或「重發/更新」才能開始。</p>
+            }
+            else
+            {
+                <div class="px-2 mb-3" style="font-size:0.8rem;">
+                    <div class="d-flex align-items-center gap-1">
+                        <span class="hint">目前模式：</span>
+                        <span class="mode-chip">@FlowModeRoute.DisplayName(mode)</span>
+                        @if (!IsSwitchLocked)
+                        {
+                            <button class="btn btn-link p-0 align-baseline" style="font-size:0.8rem;" @onclick="ConfirmSwitch">切換</button>
+                        }
+                    </div>
+                    @if (IsSwitchLocked)
                     {
-                        <button class="btn btn-link p-0 align-baseline" style="font-size:0.8rem;" @onclick="ConfirmSwitch">切換</button>
+                        <div class="hint" style="font-size:0.7rem;">已進入步驟3，不能切換</div>
                     }
                 </div>
-                @if (IsSwitchLocked)
-                {
-                    <div class="hint" style="font-size:0.7rem;">已進入步驟3，不能切換</div>
-                }
-            </div>
-        }
+            }
 
-        <ul class="nav nav-pills flex-column mb-auto">
-            @{ var enabled = CurrentMode is not null; }
-            <li class="nav-item d-flex align-items-center">
-                <span class="step-num me-2">1</span>
-                @if (enabled)
-                {
-                    <NavLink class="nav-link flex-fill" href="@StepHref("domains")">CSV 輸入 / DNS 驗證</NavLink>
-                }
-                else
-                {
-                    <span class="nav-link flex-fill disabled text-muted">CSV 輸入 / DNS 驗證</span>
-                }
-            </li>
-            <li class="nav-item d-flex align-items-center">
-                <span class="step-num me-2">2</span>
-                @if (enabled)
-                {
-                    <NavLink class="nav-link flex-fill" href="@StepHref("csr")">建立 CSR / Key</NavLink>
-                }
-                else
-                {
-                    <span class="nav-link flex-fill disabled text-muted">建立 CSR / Key</span>
-                }
-            </li>
-            <li class="nav-item d-flex align-items-center">
-                <span class="step-num me-2">3</span>
-                @if (enabled)
-                {
-                    <NavLink class="nav-link flex-fill" href="@StepHref("order")">@Step3Label</NavLink>
-                }
-                else
-                {
-                    <span class="nav-link flex-fill disabled text-muted">@Step3Label</span>
-                }
-            </li>
-            <li class="nav-item d-flex align-items-center">
-                <span class="step-num me-2">4</span>
-                @if (enabled)
-                {
-                    <NavLink class="nav-link flex-fill" href="@StepHref("upload")">web.config 放行 / 上傳驗證檔</NavLink>
-                }
-                else
-                {
-                    <span class="nav-link flex-fill disabled text-muted">web.config 放行 / 上傳驗證檔</span>
-                }
-            </li>
-            <li class="nav-item d-flex align-items-center">
-                <span class="step-num me-2">5</span>
-                @if (enabled)
-                {
-                    <NavLink class="nav-link flex-fill" href="@StepHref("collect")">等待簽發</NavLink>
-                }
-                else
-                {
-                    <span class="nav-link flex-fill disabled text-muted">等待簽發</span>
-                }
-            </li>
-            <li class="nav-item d-flex align-items-center">
-                <span class="step-num me-2">6</span>
-                @if (enabled)
-                {
-                    <NavLink class="nav-link flex-fill" href="@StepHref("pfx")">整理清單 / 打包 PFX</NavLink>
-                }
-                else
-                {
-                    <span class="nav-link flex-fill disabled text-muted">整理清單 / 打包 PFX</span>
-                }
-            </li>
-        </ul>
+            <ul class="nav nav-pills flex-column mb-auto">
+                @{ var enabled = CurrentMode is not null; }
+                <li class="nav-item d-flex align-items-center">
+                    <span class="step-num me-2">1</span>
+                    @if (enabled)
+                    {
+                        <NavLink class="nav-link flex-fill" href="@StepHref("domains")">CSV 輸入 / DNS 驗證</NavLink>
+                    }
+                    else
+                    {
+                        <span class="nav-link flex-fill disabled text-muted">CSV 輸入 / DNS 驗證</span>
+                    }
+                </li>
+                <li class="nav-item d-flex align-items-center">
+                    <span class="step-num me-2">2</span>
+                    @if (enabled)
+                    {
+                        <NavLink class="nav-link flex-fill" href="@StepHref("csr")">建立 CSR / Key</NavLink>
+                    }
+                    else
+                    {
+                        <span class="nav-link flex-fill disabled text-muted">建立 CSR / Key</span>
+                    }
+                </li>
+                <li class="nav-item d-flex align-items-center">
+                    <span class="step-num me-2">3</span>
+                    @if (enabled)
+                    {
+                        <NavLink class="nav-link flex-fill" href="@StepHref("order")">@Step3Label</NavLink>
+                    }
+                    else
+                    {
+                        <span class="nav-link flex-fill disabled text-muted">@Step3Label</span>
+                    }
+                </li>
+                <li class="nav-item d-flex align-items-center">
+                    <span class="step-num me-2">4</span>
+                    @if (enabled)
+                    {
+                        <NavLink class="nav-link flex-fill" href="@StepHref("upload")">web.config 放行 / 上傳驗證檔</NavLink>
+                    }
+                    else
+                    {
+                        <span class="nav-link flex-fill disabled text-muted">web.config 放行 / 上傳驗證檔</span>
+                    }
+                </li>
+                <li class="nav-item d-flex align-items-center">
+                    <span class="step-num me-2">5</span>
+                    @if (enabled)
+                    {
+                        <NavLink class="nav-link flex-fill" href="@StepHref("collect")">等待簽發</NavLink>
+                    }
+                    else
+                    {
+                        <span class="nav-link flex-fill disabled text-muted">等待簽發</span>
+                    }
+                </li>
+                <li class="nav-item d-flex align-items-center">
+                    <span class="step-num me-2">6</span>
+                    @if (enabled)
+                    {
+                        <NavLink class="nav-link flex-fill" href="@StepHref("pfx")">整理清單 / 打包 PFX</NavLink>
+                    }
+                    else
+                    {
+                        <span class="nav-link flex-fill disabled text-muted">整理清單 / 打包 PFX</span>
+                    }
+                </li>
+            </ul>
+        }
     </div>
 </div>
 
@@ -130,6 +153,19 @@
     /// NavMenu 是 Layout 的一部分，換頁不會重新建立這個元件，要自己訂閱 LocationChanged
     /// 才會跟著目前網址即時更新，不然這裡永遠停在第一次載入時的路徑。</summary>
     private static readonly string[] LockedSteps = ["order", "upload", "collect", "pfx"];
+
+    private static readonly (int Num, string Step, string Label)[] ManualSteps =
+    [
+        (1, "domains", "品牌清單 / DNS 驗證"),
+        (2, "csr", "建立 CSR / Key"),
+        (3, "upload", "web.config 放行 / 上傳驗證檔"),
+        (4, "import", "匯入憑證 ZIP"),
+        (5, "pfx", "打包 PFX / 封存"),
+    ];
+
+    /// <summary>目前在人工模式（其他憑證商）的頁面：網址第一段是 manual。</summary>
+    private bool IsManual =>
+        Nav.ToBaseRelativePath(Nav.Uri).Split(['/', '?', '#'])[0].Equals("manual", StringComparison.OrdinalIgnoreCase);
 
     private bool IsSwitchLocked
     {

@@ -26,7 +26,8 @@ public sealed class PfxService
         CertFileGroup group,
         string? outputFolder = null,
         string? manualPassword = null,
-        string? workRootOverride = null)
+        string? workRootOverride = null,
+        bool recordToDb = true)
     {
         var commonName = group.Domain;
         var folderName = DomainFolderNaming.ToFolderName(commonName);
@@ -84,7 +85,8 @@ public sealed class PfxService
             File.Copy(pfxFile, Path.Combine(outputFolder, pfxFileName), overwrite: true);
         }
 
-        _fileRepo.TryUpsert(commonName);
+        // 人工模式（其他憑證商）不存資料庫，呼叫時傳 recordToDb: false；NicSRS 照舊記錄。
+        if (recordToDb) _fileRepo.TryUpsert(commonName);
 
         return new PfxResult(commonName, true, "PFX 產生完成", pfxFile, friendlyName);
     }

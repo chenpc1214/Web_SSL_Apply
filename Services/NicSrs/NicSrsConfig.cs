@@ -26,6 +26,10 @@ public sealed class NicSrsConfig
     [JsonPropertyName("ArchiveRoot")]
     public string ArchiveRoot { get; set; } = "";
 
+    /// <summary>人工模式（其他憑證商）的工作區，選填。見 ManualWorkspace。</summary>
+    [JsonPropertyName("ManualWorkRoot")]
+    public string ManualWorkRoot { get; set; } = "";
+
     [JsonPropertyName("DefaultDcvMethod")]
     public string DefaultDcvMethod { get; set; } = "HTTP_CSR_HASH";
 
@@ -173,6 +177,7 @@ public sealed class NicSrsConfigLoader
         ApiToken = _protector.Unprotect(e.ApiTokenEncrypted),
         WorkRoot = e.WorkRoot,
         ArchiveRoot = e.ArchiveRoot,
+        ManualWorkRoot = e.ManualWorkRoot,
         DefaultDcvMethod = e.DefaultDcvMethod,
         PollIntervalSeconds = e.PollIntervalSeconds,
         PollMaxMinutes = e.PollMaxMinutes,
@@ -199,6 +204,7 @@ public sealed class NicSrsConfigLoader
         e.ApiTokenEncrypted = _protector.Protect(cfg.ApiToken);
         e.WorkRoot = cfg.WorkRoot;
         e.ArchiveRoot = (cfg.ArchiveRoot ?? "").Trim();
+        e.ManualWorkRoot = (cfg.ManualWorkRoot ?? "").Trim();
         e.DefaultDcvMethod = cfg.DefaultDcvMethod;
         e.PollIntervalSeconds = cfg.PollIntervalSeconds;
         e.PollMaxMinutes = cfg.PollMaxMinutes;

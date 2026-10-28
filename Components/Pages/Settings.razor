@@ -19,6 +19,10 @@
         <label class="form-label mt-3">封存資料夾（選填）</label>
         <input class="form-control" @bind="_cfg.ArchiveRoot" placeholder="例如 D:\Certs\Archive（不存在會自動建立）" />
         <div class="hint mt-1">步驟6「封存並清理」會把已打包 PFX 的網域資料夾搬到這裡；沒填的話那個按鈕不能按。</div>
+
+        <label class="form-label mt-3">其他憑證商工作區（選填）</label>
+        <input class="form-control" @bind="_cfg.ManualWorkRoot" placeholder="例如 D:\test（不存在會自動建立）" />
+        <div class="hint mt-1">非 NicSRS 的憑證用這裡：品牌 CSV 放 <code>BrandCsv</code>、憑證 ZIP 放 <code>ZipCrt</code>，網域資料夾在 <code>Other_Brand_CRT_Preparatory_Area</code>，PFX 在 <code>PFX_Storage</code>；封存跟 NicSRS 用同一個封存資料夾。沒填的話總覽的「其他憑證商」不能按。</div>
     </div>
 </div>
 

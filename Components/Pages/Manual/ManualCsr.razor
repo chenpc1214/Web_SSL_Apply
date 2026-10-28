@@ -1,0 +1,149 @@
+@page "/manual/csr"
+@rendermode InteractiveServer
+@inherits ManualPageBase
+@using SslWebConsole.Models
+@using SslWebConsole.Services
+@inject CsrService CsrSvc
+
+<PageTitle>步驟2 · 建立 CSR / Key</PageTitle>
+
+<h1 class="h3 mb-1">步驟2 · 建立 CSR / Key</h1>
+<p class="hint mb-1">產生私鑰和 CSR，再按「複製 CSR」貼到憑證商的網站下單。</p>
+<details class="help mb-4">
+    <summary><i class="bi bi-info-circle me-1"></i>說明</summary>
+    <p class="hint mb-0">網域資料夾已經存在時不會覆蓋，要重新產生請先按「刪除並重新開始」。「批次產生」會處理這個品牌全部的網域，已經有資料夾的會跳過。</p>
+</details>
+
+<ManualBrandHeader Ready="Ready" Problem="@Problem" Brand="@Brand" />
+
+@if (Ready && Problem is null)
+{
+    <div class="card mb-4">
+        <div class="card-body">
+            <button class="btn btn-primary" disabled="@_busy" @onclick="GenerateAll" title="處理這個品牌全部的網域，已經有資料夾的會跳過">批次產生 CSR</button>
+        </div>
+    </div>
+
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                    <thead><tr><th>CommonName</th><th>Organization</th><th>Locality</th><th>Status</th><th></th></tr></thead>
+                    <tbody>
+                        @foreach (var row in PagedRows)
+                        {
+                            var state = _states.GetValueOrDefault(row.CommonName);
+                            var exists = CsrSvc.DomainFolderExists(row.CommonName, Workspace.DomainRoot);
+                            var csrPath = CsrPath(row);
+                            <tr>
+                                <td>@row.CommonName</td>
+                                <td>@row.Organization</td>
+                                <td>@row.Locality</td>
+                                <td>
+                                    @if (state is not null)
+                                    {
+                                        <span class="badge @(state.Success ? "text-bg-success" : "text-bg-danger")">@state.Message</span>
+                                    }
+                                    else if (csrPath is not null)
+                                    {
+                                        <span class="badge text-bg-success">已產生</span>
+                                    }
+                                    else
+                                    {
+                                        <span class="badge @(exists ? "text-bg-warning" : "text-bg-secondary")">@(exists ? "資料夾已存在，但沒有 CSR" : "尚未產生")</span>
+                                    }
+                                </td>
+                                <td class="d-flex gap-2 flex-wrap">
+                                    <button class="btn btn-outline-primary btn-sm" @onclick="() => Generate(row)" disabled="@(_busy || exists)">產生 CSR</button>
+                                    <button class="btn btn-outline-secondary btn-sm" @onclick="() => CopyCsr(row)" disabled="@(csrPath is null)"><i class="bi bi-clipboard me-1"></i>複製 CSR</button>
+                                    <button class="btn btn-outline-danger btn-sm" @onclick="() => DeleteAndRestart(row)" disabled="@(_busy || !exists)">刪除並重新開始</button>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                <Pager TotalCount="Rows.Count" PageSize="PageSize" CurrentPage="CurrentPage" CurrentPageChanged="p => CurrentPage = p" />
+            </div>
+            @if (!string.IsNullOrEmpty(_message))
+            {
+                <p class="hint mt-2 mb-0">@_message</p>
+            }
+        </div>
+    </div>
+}
+
+@code {
+    private readonly Dictionary<string, CsrResult> _states = new(StringComparer.OrdinalIgnoreCase);
+    private bool _busy;
+    private string _message = "";
+
+    /// <summary>CSR 檔（CsrService 固定命名 &lt;資料夾&gt;_CSR.csr），沒有就回 null。</summary>
+    private string? CsrPath(DomainRecord row)
+    {
+        var folder = DomainFolderNaming.ToFolderName(row.CommonName);
+        var path = Path.Combine(Workspace.DomainRoot, folder, $"{folder}_CSR.csr");
+        return File.Exists(path) ? path : null;
+    }
+
+    private Task<CsrResult> GenerateOne(DomainRecord row) => CsrSvc.GenerateAsync(
+        row.CommonName,
+        string.IsNullOrWhiteSpace(row.Organization) ? "IT" : row.Organization,
+        organizationalUnit: "IT",
+        locality: row.Locality,
+        state: row.Locality,
+        country: "TW",
+        workRootOverride: Workspace.DomainRoot);
+
+    private async Task Generate(DomainRecord row)
+    {
+        _busy = true;
+        try { _states[row.CommonName] = await GenerateOne(row); }
+        finally { _busy = false; }
+    }
+
+    private async Task GenerateAll()
+    {
+        _busy = true;
+        try
+        {
+            foreach (var row in Rows)
+            {
+                if (CsrSvc.DomainFolderExists(row.CommonName, Workspace.DomainRoot)) continue;
+                _states[row.CommonName] = await GenerateOne(row);
+                StateHasChanged();
+            }
+        }
+        finally { _busy = false; }
+    }
+
+    private async Task CopyCsr(DomainRecord row)
+    {
+        var path = CsrPath(row);
+        if (path is null) return;
+        try
+        {
+            await JS.InvokeVoidAsync("navigator.clipboard.writeText", await File.ReadAllTextAsync(path));
+            _message = $"已複製 {row.CommonName} 的 CSR，{DateTime.Now:HH:mm:ss}";
+        }
+        catch (JSException)
+        {
+            _message = $"瀏覽器不允許複製到剪貼簿，請直接開檔案：{path}";
+        }
+    }
+
+    private async Task DeleteAndRestart(DomainRecord row)
+    {
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            icon = "warning",
+            title = $"確定要刪除「{row.CommonName}」整個網域資料夾嗎？",
+            text = "資料夾裡的私鑰、CSR、驗證檔、憑證都會被刪除，無法復原。如果已經用這份 CSR 下單，刪掉後拿到的憑證就對不上了。",
+            confirmText = "刪除並重新開始",
+            danger = true,
+        });
+        if (!confirmed) return;
+
+        CsrSvc.DeleteAndRestart(row.CommonName, Workspace.DomainRoot);
+        _states.Remove(row.CommonName);
+    }
+}

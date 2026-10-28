@@ -1,0 +1,229 @@
+@page "/manual/upload"
+@rendermode InteractiveServer
+@inherits ManualPageBase
+@implements IAsyncDisposable
+@using SslWebConsole.Models
+@using SslWebConsole.Services
+@inject ValidationUploadService UploadSvc
+@inject WebConfigPatchService WebConfigSvc
+
+<PageTitle>步驟3 · web.config 放行 / 上傳驗證檔</PageTitle>
+
+@if (_batchRunning)
+{
+    <NavigationLock ConfirmExternalNavigation="true" />
+}
+
+<h1 class="h3 mb-1">步驟3 · web.config 放行 / 上傳驗證檔</h1>
+<p class="hint mb-1">把憑證商給的驗證檔（.txt）放進對應的網域資料夾，再從這裡上傳。只顯示已經產生 CSR 的網域。</p>
+<details class="help mb-4">
+    <summary><i class="bi bi-info-circle me-1"></i>說明</summary>
+    <p class="hint mb-0">上傳到 FTP 遠端的 <code>.well-known/pki-validation/</code>。資料夾裡只能有一個 .txt，有兩個以上會不上傳並列出檔名，避免傳錯檔。
+        網域資料夾在 <code>@(Workspace.IsConfigured ? Workspace.DomainRoot : "")</code>。</p>
+</details>
+
+<ManualBrandHeader Ready="Ready" Problem="@Problem" Brand="@Brand" />
+
+@if (Ready && Problem is null)
+{
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="section-title"><i class="bi bi-collection me-1"></i>批次處理</div>
+            <p class="hint">依序對選取的網域做「注入放行規則」＋「上傳驗證檔」；單筆失敗不影響其他筆。</p>
+            <div class="d-flex gap-2 flex-wrap align-items-center">
+                <button class="btn btn-outline-secondary btn-sm" disabled="@_busy" @onclick="SelectAll">全選</button>
+                <button class="btn btn-outline-secondary btn-sm" disabled="@_busy" @onclick="() => _selected.Clear()">取消全選</button>
+                <button class="btn btn-primary btn-sm" disabled="@(_selected.Count == 0 || _busy)" @onclick="StartBatch">批次處理（@_selected.Count）</button>
+                @if (_batchRunning)
+                {
+                    <button class="btn btn-outline-danger btn-sm" @onclick="StopBatch">停止批次</button>
+                    <span class="text-muted">執行中… @_batchDone / @_batchTotal</span>
+                }
+            </div>
+        </div>
+    </div>
+
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                    <thead><tr><th></th><th>CommonName</th><th>IP</th><th>驗證檔</th><th>Action</th></tr></thead>
+                    <tbody>
+                        @foreach (var row in PagedVisible)
+                        {
+                            var txt = TxtFiles(row);
+                            <tr>
+                                <td>
+                                    <input class="form-check-input" type="checkbox" disabled="@_busy"
+                                           checked="@_selected.Contains(row.CommonName)"
+                                           @onchange="e => ToggleSelected(row.CommonName, (bool)e.Value!)" />
+                                </td>
+                                <td>@row.CommonName</td>
+                                <td>@row.Ip</td>
+                                <td>
+                                    @if (txt.Count == 0)
+                                    {
+                                        <span class="badge text-bg-secondary">還沒放</span>
+                                    }
+                                    else if (txt.Count == 1)
+                                    {
+                                        <span class="badge text-bg-success" title="@txt[0]">@txt[0]</span>
+                                    }
+                                    else
+                                    {
+                                        <span class="badge text-bg-danger" title="@string.Join("、", txt)">有 @txt.Count 個 .txt</span>
+                                    }
+                                </td>
+                                <td class="d-flex gap-2 flex-wrap">
+                                    <button class="btn btn-outline-primary btn-sm" disabled="@_busy" @onclick="() => PatchWebConfig(row)">注入放行規則</button>
+                                    <button class="btn btn-outline-primary btn-sm" disabled="@(_busy || txt.Count != 1)" @onclick="() => UploadValidation(row)">上傳驗證檔</button>
+                                    <button class="btn btn-outline-danger btn-sm" disabled="@_busy" @onclick="() => RestoreWebConfig(row)">還原 web.config</button>
+                                </td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                <Pager TotalCount="_visible.Count" PageSize="PageSize" CurrentPage="CurrentPage" CurrentPageChanged="p => CurrentPage = p" />
+            </div>
+            @if (_visible.Count == 0)
+            {
+                <p class="hint mb-0">這個品牌還沒有網域產生 CSR，請先到步驟2。</p>
+            }
+        </div>
+    </div>
+
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="section-title mb-2"><i class="bi bi-terminal me-1"></i>執行紀錄</div>
+            <div class="log-panel">@string.Join("\n", _log)</div>
+        </div>
+    </div>
+}
+
+@code {
+    private List<DomainRecord> _visible = [];
+    private readonly List<string> _log = [];
+    private readonly HashSet<string> _selected = new(StringComparer.OrdinalIgnoreCase);
+    private bool _busy;
+    private bool _batchRunning;
+    private CancellationTokenSource? _batchCts;
+    private int _batchDone;
+    private int _batchTotal;
+
+    private List<DomainRecord> PagedVisible => _visible.Skip((CurrentPage - 1) * PageSize).Take(PageSize).ToList();
+
+    /// <summary>只留已經有網域資料夾（產生過 CSR）的——沒有資料夾就沒有驗證檔可傳，web.config 的備份也沒地方放。</summary>
+    protected override void OnBrandLoaded() =>
+        _visible = Rows.Where(r => Directory.Exists(DomainDir(r))).ToList();
+
+    private List<string> TxtFiles(DomainRecord row)
+    {
+        var dir = DomainDir(row);
+        return Directory.Exists(dir) ? Directory.GetFiles(dir, "*.txt").Select(f => Path.GetFileName(f)).OfType<string>().ToList() : [];
+    }
+
+    private void AppendLog(string message) => _log.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {message}");
+
+    private ValidationUploadResult DoUpload(DomainRecord row) =>
+        UploadSvc.Upload(row, testMode: false, workRootOverride: Workspace.DomainRoot, requireSingleTxt: true);
+
+    private async Task UploadValidation(DomainRecord row)
+    {
+        _busy = true;
+        try
+        {
+            var result = await Task.Run(() => DoUpload(row));
+            AppendLog($"[{row.CommonName}] 上傳驗證檔: {result.Outcome} — {result.Message}");
+        }
+        finally { _busy = false; }
+    }
+
+    private async Task PatchWebConfig(DomainRecord row)
+    {
+        _busy = true;
+        try
+        {
+            var result = await Task.Run(() => WebConfigSvc.Patch(row, workRootOverride: Workspace.DomainRoot));
+            AppendLog($"[{row.CommonName}] web.config 注入: {result.Outcome} — {result.Message}");
+        }
+        finally { _busy = false; }
+    }
+
+    private async Task RestoreWebConfig(DomainRecord row)
+    {
+        _busy = true;
+        try
+        {
+            var result = await Task.Run(() => WebConfigSvc.Restore(row, workRootOverride: Workspace.DomainRoot));
+            AppendLog($"[{row.CommonName}] web.config 還原: {result.Outcome} — {result.Message}");
+        }
+        finally { _busy = false; }
+    }
+
+    private void ToggleSelected(string commonName, bool isChecked)
+    {
+        if (isChecked) _selected.Add(commonName);
+        else _selected.Remove(commonName);
+    }
+
+    private void SelectAll()
+    {
+        foreach (var row in _visible) _selected.Add(row.CommonName);
+    }
+
+    private async Task StartBatch()
+    {
+        _batchRunning = true;
+        _busy = true;
+        _batchCts = new CancellationTokenSource();
+        var targets = _visible.Where(r => _selected.Contains(r.CommonName)).ToList();
+        _batchTotal = targets.Count;
+        _batchDone = 0;
+        try
+        {
+            foreach (var row in targets)
+            {
+                if (_batchCts.Token.IsCancellationRequested) break;
+
+                var patch = await Task.Run(() => WebConfigSvc.Patch(row, workRootOverride: Workspace.DomainRoot));
+                AppendLog($"[{row.CommonName}] web.config 注入: {patch.Outcome} — {patch.Message}");
+                var upload = await Task.Run(() => DoUpload(row));
+                AppendLog($"[{row.CommonName}] 上傳驗證檔: {upload.Outcome} — {upload.Message}");
+
+                _selected.Remove(row.CommonName);
+                _batchDone++;
+                StateHasChanged();
+
+                try { await Task.Delay(500, _batchCts.Token); }
+                catch (OperationCanceledException) { }
+            }
+        }
+        finally
+        {
+            _batchRunning = false;
+            _busy = false;
+            StateHasChanged();
+        }
+    }
+
+    private void StopBatch() => _batchCts?.Cancel();
+
+    /// <summary>批次執行中點側邊欄連結要先確認（同 NicSRS 步驟4，見 unsaved-guard.js）。</summary>
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        await base.OnAfterRenderAsync(firstRender);
+        _guardSynced = true;
+        try { await JS.InvokeVoidAsync("unsavedGuard.update", _batchRunning, "批次還在執行中，離開的話還沒開始的會停止（已經跑完的不會被撤銷）。"); }
+        catch (JSDisconnectedException) { }
+    }
+
+    private bool _guardSynced;
+
+    public async ValueTask DisposeAsync()
+    {
+        _batchCts?.Cancel();
+        if (!_guardSynced) return;
+        try { await JS.InvokeVoidAsync("unsavedGuard.clear"); }
+        catch (JSDisconnectedException) { }
+    }
+}

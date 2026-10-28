@@ -13,6 +13,9 @@ public sealed class WorkRootResolver
 {
     public const string DomainFolderSubDir = "CRT_Preparatory_Area";
 
+    /// <summary>人工模式（其他憑證商）的網域資料夾上層名稱，見 ManualWorkspace。</summary>
+    public const string ManualDomainFolderSubDir = "Other_Brand_CRT_Preparatory_Area";
+
     private readonly NicSrsConfigLoader _configLoader;
 
     public WorkRootResolver(NicSrsConfigLoader configLoader)
@@ -34,7 +37,11 @@ public sealed class WorkRootResolver
             root = !string.IsNullOrWhiteSpace(configuredRoot) ? configuredRoot : _configLoader.ScriptsRoot;
         }
 
-        root = Path.Combine(Path.GetFullPath(root), DomainFolderSubDir);
+        // 人工模式直接傳「網域資料夾的上層」本身進來（名稱就是 Other_Brand_CRT_Preparatory_Area），
+        // 不能再往下多加一層 CRT_Preparatory_Area。NicSRS 不會傳這種路徑，行為不變。
+        root = Path.GetFullPath(root);
+        if (!string.Equals(Path.GetFileName(root.TrimEnd(Path.DirectorySeparatorChar)), ManualDomainFolderSubDir, StringComparison.OrdinalIgnoreCase))
+            root = Path.Combine(root, DomainFolderSubDir);
         Directory.CreateDirectory(root);
         return root;
     }

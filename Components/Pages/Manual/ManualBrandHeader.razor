@@ -1,0 +1,29 @@
+@* 人工模式步驟2~5頁首：載入中／問題提示（沒設定工作區、沒選品牌）／目前處理的品牌。 *@
+
+@if (!Ready)
+{
+    <p class="hint">載入中…</p>
+}
+else if (Problem is not null)
+{
+    <div class="alert alert-warning">
+        <i class="bi bi-exclamation-triangle me-1"></i>@Problem
+        <a href="/manual/domains" class="ms-1">前往步驟1</a>
+        <span class="mx-1">／</span>
+        <a href="/settings">公用設定</a>
+    </div>
+}
+else
+{
+    <div class="d-flex align-items-center gap-2 mb-3">
+        <span class="hint">目前品牌：</span>
+        <span class="mode-chip">@Brand</span>
+        <a href="/manual/domains" class="small">切換品牌</a>
+    </div>
+}
+
+@code {
+    [Parameter] public bool Ready { get; set; }
+    [Parameter] public string? Problem { get; set; }
+    [Parameter] public string Brand { get; set; } = "";
+}

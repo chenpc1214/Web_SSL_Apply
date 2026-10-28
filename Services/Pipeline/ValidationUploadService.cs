@@ -17,7 +17,9 @@ public sealed class ValidationUploadService
         _bridge = bridge;
     }
 
-    public ValidationUploadResult Upload(Models.DomainRecord row, bool testMode, string? workRootOverride = null)
+    /// <param name="requireSingleTxt">人工模式用：驗證檔是使用者手動放進資料夾的，有兩個以上的 .txt
+    /// 就不知道該傳哪個，乾脆不傳並列出檔名。NicSRS 的驗證檔由程式寫出，維持「取第一個」。</param>
+    public ValidationUploadResult Upload(Models.DomainRecord row, bool testMode, string? workRootOverride = null, bool requireSingleTxt = false)
     {
         var domain = row.CommonName.Trim();
         var folderName = DomainFolderNaming.ToFolderName(domain);
@@ -35,7 +37,11 @@ public sealed class ValidationUploadService
         if (!Directory.Exists(targetDir))
             return new ValidationUploadResult(domain, UploadOutcome.Skipped, $"找不到對應的資料夾: {targetDir}");
 
-        var txtFile = new DirectoryInfo(targetDir).GetFiles("*.txt").FirstOrDefault();
+        var txtFiles = new DirectoryInfo(targetDir).GetFiles("*.txt");
+        if (requireSingleTxt && txtFiles.Length > 1)
+            return new ValidationUploadResult(domain, UploadOutcome.Failed,
+                $"資料夾裡有 {txtFiles.Length} 個 .txt（{string.Join("、", txtFiles.Select(f => f.Name))}），不知道該傳哪個，請只留下驗證檔");
+        var txtFile = txtFiles.FirstOrDefault();
         if (txtFile is null)
             return new ValidationUploadResult(domain, UploadOutcome.Failed, $"資料夾 {targetDir} 底下沒有 .txt 驗證檔");
 

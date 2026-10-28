@@ -1,0 +1,246 @@
+@page "/manual/pfx"
+@rendermode InteractiveServer
+@inherits ManualPageBase
+@using SslWebConsole.Models
+@using SslWebConsole.Services
+@inject PfxService PfxSvc
+@inject PfxPasswordService PfxPasswordSvc
+@inject ManualArchiveService ArchiveSvc
+
+<PageTitle>步驟5 · 打包 PFX / 封存</PageTitle>
+
+<h1 class="h3 mb-1">步驟5 · 打包 PFX / 封存</h1>
+<p class="hint mb-1">把有憑證的網域打包成 PFX，做完後封存。只處理目前品牌的網域。</p>
+<details class="help mb-4">
+    <summary><i class="bi bi-info-circle me-1"></i>說明</summary>
+    <p class="hint mb-0">PFX 集中複製一份到 <code>@(Workspace.IsConfigured ? Workspace.PfxStorage : "")</code>。不寫資料庫。
+        還在等憑證（沒有 .crt）的網域不會出現在清單上，可以先處理其他網域。</p>
+</details>
+
+<ManualBrandHeader Ready="Ready" Problem="@Problem" Brand="@Brand" />
+
+@if (Ready && Problem is null)
+{
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="d-flex gap-2 flex-wrap">
+                <button class="btn btn-primary" @onclick="Scan" disabled="@_busy">重新掃描</button>
+                <button class="btn btn-outline-primary" @onclick="PackAll" disabled="@(_busy || _groups.Count == 0)">全部打包 PFX</button>
+            </div>
+
+            <div class="table-responsive mt-3">
+                <table class="table table-sm align-middle">
+                    <thead><tr><th>Domain</th><th>中繼憑證</th><th>PFX</th><th>Password</th><th></th></tr></thead>
+                    <tbody>
+                        @foreach (var g in _groups.Skip((CurrentPage - 1) * PageSize).Take(PageSize))
+                        {
+                            var result = _pfxResults.GetValueOrDefault(g.Domain);
+                            var revealed = _revealedPasswords.GetValueOrDefault(g.Domain);
+                            <tr>
+                                <td>@g.Domain</td>
+                                <td>@(g.BundlePath is null ? "（無）" : "有")</td>
+                                <td>
+                                    @if (result is not null)
+                                    {
+                                        <span class="badge @(result.Success ? "text-bg-success" : "text-bg-danger")" title="@result.Message">@(result.Success ? "完成" : "失敗")</span>
+                                    }
+                                    else if (HasPfx(g))
+                                    {
+                                        <span class="badge text-bg-success">已打包</span>
+                                    }
+                                    else
+                                    {
+                                        <span class="badge text-bg-secondary">未打包</span>
+                                    }
+                                </td>
+                                <td>
+                                    @if (revealed is not null)
+                                    {
+                                        <code>@revealed</code>
+                                        <button class="btn btn-link btn-sm p-0 ms-1" @onclick="() => _revealedPasswords.Remove(g.Domain)">隱藏</button>
+                                    }
+                                    else
+                                    {
+                                        <button class="btn btn-outline-secondary btn-sm" @onclick="() => RevealPassword(g)">顯示密碼</button>
+                                    }
+                                </td>
+                                <td><button class="btn btn-outline-secondary btn-sm" @onclick="() => Pack(g)" disabled="@_busy">打包 PFX</button></td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                <Pager TotalCount="_groups.Count" PageSize="PageSize" CurrentPage="CurrentPage" CurrentPageChanged="p => CurrentPage = p" />
+            </div>
+            @if (_groups.Count == 0)
+            {
+                <p class="hint mb-0">這個品牌還沒有網域匯入憑證（.crt + .key），請先到步驟4。</p>
+            }
+        </div>
+    </div>
+
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="section-title"><i class="bi bi-archive me-1"></i>收尾：封存本輪檔案</div>
+            <p class="hint">把這個品牌已打包 PFX 的網域資料夾（含私鑰）搬到封存資料夾、刪掉 PFX_Storage 裡對應的 PFX，
+                並把這些網域從 @(Brand).csv 搬到 @(Brand)@(ManualWorkspace.CompletedSuffix).csv。還沒打包的會留著。</p>
+            @if (string.IsNullOrWhiteSpace(ConfigLoader.Load().ArchiveRoot))
+            {
+                <div class="d-flex gap-2 align-items-center flex-wrap">
+                    <button class="btn btn-outline-primary" disabled><i class="bi bi-archive me-1"></i>封存並清理</button>
+                    <span class="hint">請先到 <a href="/settings">公用設定</a> 填寫「封存資料夾」。</span>
+                </div>
+            }
+            else
+            {
+                <button class="btn btn-outline-primary" disabled="@_busy" @onclick="RequestArchive"><i class="bi bi-archive me-1"></i>封存並清理</button>
+            }
+        </div>
+    </div>
+
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="section-title mb-2"><i class="bi bi-terminal me-1"></i>執行紀錄</div>
+            <div class="log-panel">@string.Join("\n", _log)</div>
+        </div>
+    </div>
+}
+
+@code {
+    private List<CertFileGroup> _groups = [];
+    private readonly Dictionary<string, PfxResult> _pfxResults = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, string> _revealedPasswords = new(StringComparer.OrdinalIgnoreCase);
+    private readonly List<string> _log = [];
+    private bool _busy;
+
+    protected override void OnBrandLoaded() => Scan();
+
+    /// <summary>只看這個品牌的網域資料夾裡有 .crt + .key 的。掃描是看檔案，不讀寫資料庫。</summary>
+    private void Scan()
+    {
+        _groups = new List<CertFileGroup>();
+        foreach (var row in Rows)
+        {
+            var folder = DomainFolderNaming.ToFolderName(row.CommonName);
+            var dir = Path.Combine(Workspace.DomainRoot, folder);
+            var crt = Path.Combine(dir, $"{folder}.crt");
+            var key = Path.Combine(dir, $"{folder}.key");
+            if (!File.Exists(crt) || !File.Exists(key)) continue;
+            var bundle = Path.Combine(dir, $"{folder}.ca-bundle");
+            _groups.Add(new CertFileGroup
+            {
+                Domain = row.CommonName.Trim(),
+                CertPath = crt,
+                KeyPath = key,
+                BundlePath = File.Exists(bundle) ? bundle : null,
+            });
+        }
+        CurrentPage = 1;
+        AppendLog($"掃描完成，{Brand} 有 {_groups.Count} 個網域可以打包（.crt + .key）。");
+    }
+
+    private bool HasPfx(CertFileGroup g) => File.Exists(Path.ChangeExtension(g.CertPath, ".pfx"));
+
+    private Task<PfxResult> PackOne(CertFileGroup g) =>
+        PfxSvc.CreateAsync(g, Workspace.PfxStorage, workRootOverride: Workspace.DomainRoot, recordToDb: false);
+
+    private async Task Pack(CertFileGroup g)
+    {
+        _busy = true;
+        try
+        {
+            var result = await PackOne(g);
+            _pfxResults[g.Domain] = result;
+            AppendLog($"[{g.Domain}] {(result.Success ? "打包完成" : "打包失敗")}: {result.Message}");
+        }
+        finally { _busy = false; }
+    }
+
+    private async Task PackAll()
+    {
+        _busy = true;
+        try
+        {
+            foreach (var g in _groups)
+            {
+                var result = await PackOne(g);
+                _pfxResults[g.Domain] = result;
+                AppendLog($"[{g.Domain}] {(result.Success ? "打包完成" : "打包失敗")}: {result.Message}");
+                StateHasChanged();
+            }
+        }
+        finally { _busy = false; }
+    }
+
+    private void RevealPassword(CertFileGroup g)
+    {
+        try { _revealedPasswords[g.Domain] = PfxPasswordSvc.ComputePassword(DomainFolderNaming.ToFolderName(g.Domain)); }
+        catch (InvalidOperationException ex) { AppendLog($"[{g.Domain}] 算不出密碼：{ex.Message}"); }
+    }
+
+    private async Task RequestArchive()
+    {
+        ArchivePlan plan;
+        try { plan = ArchiveSvc.Plan(Brand); }
+        catch (IOException ex)
+        {
+            AppendLog($"讀不了 {Brand}.csv：{ex.Message}（如果在 Excel 裡開著，請先關閉）");
+            return;
+        }
+
+        if (plan.Ready.Count == 0)
+        {
+            AppendLog(plan.Skipped.Count > 0
+                ? $"沒有可封存的資料夾（{plan.Skipped.Count} 個還沒打包 PFX）。"
+                : "這個品牌沒有可封存的網域資料夾。");
+            return;
+        }
+
+        var skippedNames = plan.Skipped.Select(s => Path.GetFileName(s.Dir)).ToList();
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            icon = "warning",
+            title = $"確定要封存 {plan.Ready.Count} 個網域資料夾嗎？",
+            text = $"搬到 {plan.ArchiveRoot}，刪除 PFX_Storage 裡對應的 {plan.PfxFiles.Count} 個 PFX，並把這些網域移到 {Brand}{ManualWorkspace.CompletedSuffix}.csv。"
+                + (skippedNames.Count > 0 ? $"另有 {skippedNames.Count} 個還沒打包，會留著：{string.Join("、", skippedNames)}。" : ""),
+            items = plan.Ready.Select(d => Path.GetFileName(d)).ToList(),
+            confirmText = "確定封存",
+        });
+        if (!confirmed) return;
+
+        _busy = true;
+        try
+        {
+            var result = await Task.Run(() => ArchiveSvc.Archive(Brand, plan));
+            foreach (var line in result.Archive.Log) AppendLog(line);
+            AppendLog($"封存完成：搬移 {result.Archive.Moved} 個、失敗 {result.Archive.Failed} 個、刪除 PFX {result.Archive.PfxDeleted} 個。");
+            if (result.CsvError is not null) AppendLog(result.CsvError);
+            else AppendLog($"已把 {result.MovedToCompletedCsv} 筆從 {Brand}.csv 移到 {Brand}{ManualWorkspace.CompletedSuffix}.csv（原檔備份為 {Brand}.csv.bak）。");
+
+            // 封存走的網域已經不在品牌 CSV 和網域資料夾裡了，重新整理清單
+            _pfxResults.Clear();
+            _revealedPasswords.Clear();
+            await ReloadRowsAsync();
+        }
+        catch (Exception ex)
+        {
+            AppendLog($"封存失敗：{ex.Message}");
+        }
+        finally { _busy = false; }
+    }
+
+    private Task ReloadRowsAsync()
+    {
+        try
+        {
+            ReplaceRows(CsvStore.Load(Brand).Rows);
+            Scan();
+        }
+        catch (IOException ex)
+        {
+            AppendLog($"重新讀取 {Brand}.csv 失敗：{ex.Message}");
+        }
+        return Task.CompletedTask;
+    }
+
+    private void AppendLog(string message) => _log.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {message}");
+}

@@ -1,0 +1,577 @@
+@page "/manual/domains"
+@rendermode InteractiveServer
+@implements IAsyncDisposable
+@using SslWebConsole.Models
+@using SslWebConsole.Services
+@inject ManualWorkspace Workspace
+@inject BrandCsvStore CsvStore
+@inject LocalityRepository LocalityRepo
+@inject DnsCheckService DnsCheck
+@inject CrmSettingsRepository CrmSettingsRepo
+@inject CrmVerifyService CrmVerifySvc
+@inject ValidationUploadService FtpSvc
+@inject NicSrsConfigLoader ConfigLoader
+@inject IJSRuntime JS
+
+<PageTitle>步驟1 · 品牌清單 / DNS 驗證</PageTitle>
+
+<NavigationLock ConfirmExternalNavigation="@HasUnsavedChanges" />
+
+<h1 class="h3 mb-1">步驟1 · 品牌清單 / DNS 驗證</h1>
+<p class="hint mb-1">其他憑證商：選一個品牌 CSV，資料直接存回那個 CSV，不寫資料庫。</p>
+<details class="help mb-4">
+    <summary><i class="bi bi-info-circle me-1"></i>說明</summary>
+    <p class="hint mb-0">品牌 CSV 放在 <code>@(Workspace.IsConfigured ? Workspace.BrandCsvDir : "（尚未設定工作區）")</code>，欄位格式跟 SSL_List.csv 一樣，FtpPass 是明碼。
+        存檔前會檢查檔案有沒有在讀進來之後被 Excel 改過，有的話不會覆蓋。同一個網域不能同時出現在兩個品牌 CSV（會共用同一個網域資料夾）。
+        這裡選的品牌，步驟2~5 都會沿用（每個瀏覽器分頁各自記住）。</p>
+</details>
+
+@if (!_ready)
+{
+    <p class="hint">載入中…</p>
+}
+else if (!Workspace.IsConfigured)
+{
+    <div class="alert alert-warning"><i class="bi bi-exclamation-triangle me-1"></i>尚未設定「其他憑證商工作區」，請先到 <a href="/settings">公用設定</a> 填寫。</div>
+}
+else
+{
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="section-title"><i class="bi bi-tags me-1"></i>品牌</div>
+            @if (_brands.Count == 0)
+            {
+                <p class="hint mb-0">還沒有品牌 CSV。請把 CSV（例如 A_Brand.csv）放到 <code>@Workspace.BrandCsvDir</code>，再按「重新整理清單」。</p>
+                <button class="btn btn-outline-secondary btn-sm mt-2" @onclick="RefreshBrands">重新整理清單</button>
+            }
+            else
+            {
+                <div class="d-flex align-items-center gap-2 flex-wrap">
+                    <select @key="_brandSelectKey" class="form-select" style="max-width:320px" value="@_brand" @onchange="e => RequestSwitchBrand(e.Value?.ToString() ?? string.Empty)">
+                        <option value="">（請選擇品牌）</option>
+                        @foreach (var b in _brands)
+                        {
+                            <option value="@b">@b</option>
+                        }
+                    </select>
+                    <button class="btn btn-outline-secondary btn-sm" @onclick="RefreshBrands">重新整理清單</button>
+                </div>
+            }
+            @if (_loadError is not null)
+            {
+                <div class="alert alert-danger mt-3 mb-0">@_loadError</div>
+            }
+        </div>
+    </div>
+
+    @if (_snapshot is not null)
+    {
+        <div class="card mb-4" data-unsaved-guard>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle table-stack">
+                        <thead>
+                            <tr>
+                                <th>ID</th><th>CommonName</th><th>Organization</th><th>IP</th>
+                                <th>FtpUser</th><th>FtpPass</th><th>FtpFolder</th><th>Locality</th><th>進度</th><th></th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            @foreach (var row in PagedRows)
+                            {
+                                var progress = Progress(row);
+                                <tr>
+                                    <td data-label="ID"><input class="form-control form-control-sm" style="min-width:7ch" @bind="row.Id" /></td>
+                                    <td data-label="CommonName"><input class="form-control form-control-sm" style="min-width:24ch" @bind="row.CommonName" @bind:after="() => AutoFillOrganization(row)" /></td>
+                                    <td data-label="Organization"><input class="form-control form-control-sm" style="min-width:16ch" @bind="row.Organization" /></td>
+                                    <td data-label="IP"><input class="form-control form-control-sm" style="min-width:14ch" @bind="row.Ip" /></td>
+                                    <td data-label="FtpUser"><input class="form-control form-control-sm" style="min-width:14ch" @bind="row.FtpUser" /></td>
+                                    <td data-label="FtpPass"><input class="form-control form-control-sm" style="min-width:14ch" type="text" @bind="row.FtpPass" /></td>
+                                    <td data-label="FtpFolder"><input class="form-control form-control-sm" style="min-width:16ch" @bind="row.FtpFolder" /></td>
+                                    <td data-label="Locality">
+                                        <select class="form-select form-select-sm" style="min-width:16ch" @bind="row.Locality">
+                                            <option value="">（未選）</option>
+                                            @foreach (var locality in _localities)
+                                            {
+                                                <option value="@locality.Name">@locality.DisplayLabel</option>
+                                            }
+                                        </select>
+                                    </td>
+                                    <td data-label="進度"><span class="badge @progress.Css">@progress.Label</span></td>
+                                    <td class="text-end"><button class="btn-icon danger" title="從清單移除（按「儲存」才會寫回 CSV；網域資料夾不會被刪）" @onclick="() => RemoveRow(row)"><i class="bi bi-trash"></i></button></td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                    <Pager TotalCount="_rows.Count" PageSize="PageSize" @bind-CurrentPage="_page" />
+                </div>
+
+                <div class="mt-3">
+                    <div class="hint text-uppercase" style="font-size:0.7rem; letter-spacing:.05em;">資料維護</div>
+                    <div class="d-flex align-items-center gap-2 mt-1 flex-wrap">
+                        <button class="btn btn-outline-secondary" @onclick="AddRow">新增列</button>
+                        <button class="btn btn-primary" @onclick="RequestSave">儲存</button>
+                        <button class="btn btn-outline-secondary" @onclick="RequestReload" title="重新讀取 CSV（例如剛在 Excel 改過）">重新載入</button>
+                    </div>
+                    <span class="hint" style="font-size:0.75rem;">寫回 <code>@Workspace.BrandCsvPath(_snapshot.Brand)</code>，維持原本的編碼</span>
+                </div>
+
+                <div class="mt-3">
+                    <div class="hint text-uppercase" style="font-size:0.7rem; letter-spacing:.05em;">驗證（檢查畫面上目前的內容，不用先存檔）</div>
+                    <div class="d-flex align-items-center gap-2 mt-1 flex-wrap">
+                        <button class="btn btn-outline-primary" @onclick="RunDnsCheck" disabled="@_checking">@(_checking ? "檢查中..." : "全部 DNS 檢查")</button>
+                        <button class="btn btn-outline-primary" @onclick="RunFtpCheck" disabled="@_ftpChecking">@(_ftpChecking ? "驗證中..." : "FTP 驗證")</button>
+                        <button class="btn btn-outline-primary" @onclick="RunCrmVerify" disabled="@_crmRunning">@(_crmRunning ? "校對中..." : "CRM 校對")</button>
+                        @if (_crmRunning)
+                        {
+                            <button class="btn btn-outline-danger btn-sm" @onclick="StopCrmVerify">停止</button>
+                        }
+                    </div>
+                </div>
+
+                @if (!string.IsNullOrEmpty(_saveMessage))
+                {
+                    <p class="hint mt-2 mb-0">@_saveMessage</p>
+                }
+            </div>
+        </div>
+    }
+
+    @if (_dnsResults is not null)
+    {
+        <div class="card mb-4">
+            <div class="card-body">
+                <div class="section-title mb-2"><i class="bi bi-globe me-1"></i>DNS 驗證結果</div>
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead><tr><th>CommonName</th><th>Status</th><th>Root IP</th><th>WWW IP</th><th>Note</th></tr></thead>
+                        <tbody>
+                            @foreach (var r in _dnsResults)
+                            {
+                                <tr>
+                                    <td>@r.EffectiveCommonName</td>
+                                    <td><span class="badge @DnsBadgeClass(r.Status)">@r.StatusLabel</span></td>
+                                    <td><span class="badge @IpMatchBadgeClass(r, r.MainMatch)" title="@r.MainIpDisplay">@IpMatchBadgeLabel(r, r.MainMatch)</span></td>
+                                    <td><span class="badge @IpMatchBadgeClass(r, r.WwwMatch)" title="@r.WwwIpDisplay">@IpMatchBadgeLabel(r, r.WwwMatch)</span></td>
+                                    <td>@r.Remark</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    }
+
+    @if (_ftpResults.Count > 0)
+    {
+        <div class="card mb-4">
+            <div class="card-body">
+                <div class="section-title"><i class="bi bi-hdd-network me-1"></i>FTP 驗證結果</div>
+                <p class="hint">只測連線與遠端資料夾是否存在，不會上傳任何檔案。</p>
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead><tr><th>CommonName</th><th>Result</th><th>Message</th></tr></thead>
+                        <tbody>
+                            @foreach (var r in _ftpResults)
+                            {
+                                <tr>
+                                    <td>@r.CommonName</td>
+                                    <td><span class="badge @(r.Outcome == UploadOutcome.Success ? "text-bg-success" : r.Outcome == UploadOutcome.Skipped ? "text-bg-secondary" : "text-bg-danger")">@r.Outcome</span></td>
+                                    <td class="hint">@r.Message</td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    }
+
+    @if (_crmResults.Count > 0)
+    {
+        <div class="card mb-4">
+            <div class="card-body">
+                <div class="section-title"><i class="bi bi-person-check me-1"></i>CRM 校對結果</div>
+                <p class="hint">只顯示差異，不會自動改資料；覺得 CRM 的值才對，自己回上面表格改掉再按「儲存」。</p>
+                <div class="table-responsive">
+                    <table class="table table-sm align-middle">
+                        <thead><tr><th style="width:14%">Case No</th><th style="width:20%">CommonName</th><th>Result</th></tr></thead>
+                        <tbody>
+                            @foreach (var r in _crmResults)
+                            {
+                                <tr>
+                                    <td>@r.CaseNo</td>
+                                    <td>@r.CommonName</td>
+                                    <td>
+                                        <span class="badge @CrmBadgeClass(r.Outcome)">@CrmLabel(r)</span>
+                                        @if (!string.IsNullOrEmpty(r.Note))
+                                        {
+                                            <div class="hint" style="font-size:0.75rem;">@r.Note</div>
+                                        }
+                                        @if (r.Diffs.Count > 0)
+                                        {
+                                            <table class="table table-sm mt-1 mb-0" style="max-width:600px;">
+                                                <thead><tr><th>Field</th><th>Current</th><th>CRM</th></tr></thead>
+                                                <tbody>
+                                                    @foreach (var d in r.Diffs)
+                                                    {
+                                                        <tr>
+                                                            <td>@d.Field</td>
+                                                            <td class="text-danger">@d.CurrentValue</td>
+                                                            <td class="text-success">@d.CrmValue</td>
+                                                        </tr>
+                                                    }
+                                                </tbody>
+                                            </table>
+                                        }
+                                    </td>
+                                </tr>
+                            }
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    }
+}
+
+@code {
+    private bool _ready;
+    private List<string> _brands = [];
+    private string _brand = "";
+    private int _brandSelectKey;
+    private BrandCsvSnapshot? _snapshot;
+    private string? _loadError;
+    private List<DomainRecord> _rows = [];
+    private List<LocalityOption> _localities = [];
+    private string _saveMessage = "";
+
+    private List<DnsCheckResult>? _dnsResults;
+    private bool _checking;
+    private readonly List<ValidationUploadResult> _ftpResults = [];
+    private bool _ftpChecking;
+    private readonly List<CrmVerifyResult> _crmResults = [];
+    private bool _crmRunning;
+    private CancellationTokenSource? _crmCts;
+
+    private int _pageSize = 20;
+    private int PageSize => _pageSize;
+    private int _page = 1;
+    private List<DomainRecord> PagedRows => _rows.Skip((_page - 1) * PageSize).Take(PageSize).ToList();
+
+    protected override void OnInitialized()
+    {
+        _localities = LocalityRepo.GetAllOptions();
+        _pageSize = ConfigLoader.Load().PageSize;
+    }
+
+    /// <summary>品牌記在 sessionStorage，互動式渲染之後才讀得到，所以第一次 render 完才載入。</summary>
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender)
+        {
+            if (Workspace.IsConfigured)
+            {
+                try
+                {
+                    Workspace.EnsureFolders();
+                    _brands = Workspace.ListBrands();
+                    var saved = await ManualBrandSession.GetAsync(JS);
+                    if (Workspace.BrandExists(saved)) LoadBrand(saved!);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    _loadError = $"建立或讀取工作區資料夾失敗：{ex.Message}（檢查路徑和權限，IIS 要給 IIS APPPOOL\\Apply 修改權限）";
+                }
+            }
+            _ready = true;
+            StateHasChanged();
+            return;
+        }
+
+        _guardSynced = true;
+        try { await JS.InvokeVoidAsync("unsavedGuard.update", HasUnsavedChanges, "這頁有修改還沒按「儲存」，離開的話這些修改會不見。"); }
+        catch (JSDisconnectedException) { }
+    }
+
+    private bool _guardSynced;
+
+    private void RefreshBrands() => _brands = Workspace.ListBrands();
+
+    private async Task RequestSwitchBrand(string brand)
+    {
+        if (HasUnsavedChanges)
+        {
+            var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+            {
+                icon = "warning",
+                title = "目前的品牌有修改還沒儲存",
+                text = "切換品牌的話，這些修改會不見。",
+                confirmText = "不儲存，直接切換",
+            });
+            if (!confirmed)
+            {
+                // 下拉選單在瀏覽器上已經換成新的品牌了，換一個 key 讓它整個重建，才會顯示回原本的品牌
+                _brandSelectKey++;
+                return;
+            }
+        }
+
+        if (string.IsNullOrEmpty(brand))
+        {
+            _brand = "";
+            _snapshot = null;
+            _rows = [];
+            return;
+        }
+        LoadBrand(brand);
+        await ManualBrandSession.SetAsync(JS, brand);
+    }
+
+    private void LoadBrand(string brand)
+    {
+        _brand = brand;
+        _loadError = null;
+        _saveMessage = "";
+        _dnsResults = null;
+        _ftpResults.Clear();
+        _crmResults.Clear();
+        try
+        {
+            _snapshot = CsvStore.Load(brand);
+            _rows = _snapshot.Rows.Select(Clone).ToList();
+            if (_rows.Count == 0) AddRow();
+            _page = 1;
+            TakeSavedSnapshot();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _snapshot = null;
+            _rows = [];
+            _loadError = ex is IOException io && BrandCsvStore.IsLocked(io)
+                ? $"{brand}.csv 被別的程式開著（通常是 Excel），請先關閉再重新選一次。"
+                : $"讀不了 {brand}.csv：{ex.Message}";
+        }
+    }
+
+    private static DomainRecord Clone(DomainRecord r) => new()
+    {
+        Id = r.Id, CommonName = r.CommonName, Organization = r.Organization, Ip = r.Ip,
+        FtpUser = r.FtpUser, FtpPass = r.FtpPass, FtpFolder = r.FtpFolder,
+        ProductCode = r.ProductCode, Years = r.Years, Locality = r.Locality, Remark = r.Remark,
+    };
+
+    // ── 有沒有還沒存的修改：比對每一列跟上次載入/存檔時的內容，加上列數 ──
+    private readonly Dictionary<DomainRecord, string> _savedSnapshot = new(ReferenceEqualityComparer.Instance);
+    private int _savedCount;
+
+    private static string Fingerprint(DomainRecord r) => string.Join("",
+        r.Id, r.CommonName, r.Organization, r.Ip, r.FtpUser, r.FtpPass, r.FtpFolder,
+        r.ProductCode, r.Years, r.Locality, r.Remark);
+
+    private static readonly string BlankFingerprint = Fingerprint(new DomainRecord());
+
+    private void TakeSavedSnapshot()
+    {
+        _savedSnapshot.Clear();
+        foreach (var row in _rows) _savedSnapshot[row] = Fingerprint(row);
+        _savedCount = _rows.Count(r => Fingerprint(r) != BlankFingerprint);
+    }
+
+    private bool HasUnsavedChanges =>
+        _snapshot is not null &&
+        (_rows.Count(r => Fingerprint(r) != BlankFingerprint) != _savedCount ||
+         _rows.Any(r => _savedSnapshot.TryGetValue(r, out var saved) ? saved != Fingerprint(r) : Fingerprint(r) != BlankFingerprint));
+
+    private void AddRow() => _rows.Add(new DomainRecord());
+
+    private void RemoveRow(DomainRecord row)
+    {
+        _rows.Remove(row);
+        if (_rows.Count == 0) AddRow();
+    }
+
+    /// <summary>CommonName 打完、Organization 還空著就依網域猜一個（去掉 www.，取第一段）。</summary>
+    private void AutoFillOrganization(DomainRecord row)
+    {
+        if (!string.IsNullOrWhiteSpace(row.Organization)) return;
+        var labels = row.CommonName.Trim().Split('.');
+        if (labels.Length == 0 || labels[0].Length == 0) return;
+        row.Organization = string.Equals(labels[0], "www", StringComparison.OrdinalIgnoreCase) && labels.Length > 1 ? labels[1] : labels[0];
+    }
+
+    /// <summary>網域資料夾裡有哪些檔案，代表做到哪一步（人工模式不存資料庫，進度全看檔案）。</summary>
+    private (string Label, string Css) Progress(DomainRecord row)
+    {
+        if (string.IsNullOrWhiteSpace(row.CommonName)) return ("—", "text-bg-light");
+        var dir = Workspace.DomainDir(row.CommonName);
+        if (!Directory.Exists(dir)) return ("未產生 CSR", "text-bg-secondary");
+        if (Directory.EnumerateFiles(dir, "*.pfx").Any()) return ("已打包 PFX", "text-bg-success");
+        if (Directory.EnumerateFiles(dir, "*.crt").Any()) return ("已匯入憑證", "text-bg-info");
+        return ("等待憑證", "text-bg-warning");
+    }
+
+    private async Task RequestReload()
+    {
+        if (HasUnsavedChanges)
+        {
+            var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+            {
+                icon = "warning",
+                title = "要捨棄還沒儲存的修改嗎？",
+                text = "重新載入會讀取 CSV 目前的內容，畫面上還沒儲存的修改會不見。",
+                confirmText = "重新載入",
+            });
+            if (!confirmed) return;
+        }
+        LoadBrand(_brand);
+        _saveMessage = $"已重新載入 {_brand}.csv，{DateTime.Now:HH:mm:ss}";
+    }
+
+    private async Task RequestSave()
+    {
+        if (_snapshot is null) return;
+        var named = _rows.Where(r => !string.IsNullOrWhiteSpace(r.CommonName)).ToList();
+
+        // 同一個品牌裡重複：兩列會寫到同一個網域資料夾
+        var duplicates = named.GroupBy(r => r.CommonName.Trim(), StringComparer.OrdinalIgnoreCase)
+            .Where(g => g.Count() > 1).Select(g => g.Key).ToList();
+        // 其他品牌也有：兩個品牌會共用同一個網域資料夾，互相蓋掉私鑰和憑證
+        var inOthers = CsvStore.FindInOtherBrands(_snapshot.Brand, named.Select(r => r.CommonName));
+
+        if (duplicates.Count > 0 || inOthers.Count > 0)
+        {
+            var items = duplicates.Select(d => $"{d}：這個清單裡出現不只一次")
+                .Concat(inOthers.Select(kv => $"{kv.Key}：已經在 {kv.Value}.csv 裡"))
+                .ToList();
+            await JS.InvokeAsync<bool>("appDialog.confirm", new
+            {
+                icon = "error",
+                title = "有重複的網域，沒有存檔",
+                text = "同一個網域只能出現在一個品牌、一次，不然會共用同一個網域資料夾，互相蓋掉私鑰和憑證。請先修正下面這幾筆。",
+                items,
+                confirmText = "知道了",
+                cancelText = "關閉",
+            });
+            return;
+        }
+
+        try
+        {
+            _snapshot = CsvStore.Save(_snapshot, named);
+            TakeSavedSnapshot();
+            _saveMessage = $"已儲存 {named.Count} 筆到 {_snapshot.Brand}.csv，{DateTime.Now:HH:mm:ss}";
+        }
+        catch (BrandCsvChangedException ex)
+        {
+            _saveMessage = ex.Message;
+        }
+        catch (IOException ex) when (BrandCsvStore.IsLocked(ex))
+        {
+            _saveMessage = $"{_snapshot.Brand}.csv 被別的程式開著（通常是 Excel），請先關閉再按一次「儲存」。";
+        }
+        catch (UnauthorizedAccessException ex)
+        {
+            _saveMessage = $"沒有權限寫入 {_snapshot.Brand}.csv：{ex.Message}";
+        }
+    }
+
+    private async Task RunDnsCheck()
+    {
+        _checking = true;
+        _crmResults.Clear();
+        _ftpResults.Clear();
+        try { _dnsResults = await DnsCheck.CheckAsync(_rows); }
+        finally { _checking = false; }
+    }
+
+    private async Task RunFtpCheck()
+    {
+        _ftpChecking = true;
+        _dnsResults = null;
+        _crmResults.Clear();
+        _ftpResults.Clear();
+        try
+        {
+            foreach (var row in _rows.Where(r => !string.IsNullOrWhiteSpace(r.CommonName) && !string.IsNullOrWhiteSpace(r.Ip)))
+            {
+                _ftpResults.Add(await Task.Run(() => FtpSvc.Upload(row, testMode: true)));
+                StateHasChanged();
+            }
+        }
+        finally { _ftpChecking = false; }
+    }
+
+    private async Task RunCrmVerify()
+    {
+        var settings = CrmSettingsRepo.Load();
+        if (string.IsNullOrWhiteSpace(settings.Cookie))
+        {
+            _saveMessage = "尚未設定 CRM Cookie，請先到「CRM 設定」頁面填好。";
+            return;
+        }
+
+        _crmRunning = true;
+        _crmResults.Clear();
+        _dnsResults = null;
+        _ftpResults.Clear();
+        _crmCts = new CancellationTokenSource();
+        try
+        {
+            await CrmVerifySvc.VerifyAsync(_rows, targetIdFilter: null, settings.Cookie, settings.BaseUrl,
+                result => InvokeAsync(() =>
+                {
+                    _crmResults.Add(result);
+                    StateHasChanged();
+                }),
+                _crmCts.Token);
+        }
+        finally
+        {
+            _crmRunning = false;
+            StateHasChanged();
+        }
+    }
+
+    private void StopCrmVerify() => _crmCts?.Cancel();
+
+    private static string DnsBadgeClass(DnsStatus status) => status switch
+    {
+        DnsStatus.Ok => "text-bg-success",
+        DnsStatus.OkWwwWarn or DnsStatus.OkWww => "text-bg-warning",
+        DnsStatus.Fail => "text-bg-danger",
+        _ => "text-bg-secondary",
+    };
+
+    private static string IpMatchBadgeClass(DnsCheckResult r, bool columnMatch) =>
+        r.Status == DnsStatus.Ok || columnMatch ? "text-bg-success" : "text-bg-danger";
+
+    private static string IpMatchBadgeLabel(DnsCheckResult r, bool columnMatch) =>
+        r.Status == DnsStatus.Ok || columnMatch ? "OK" : "DIFF";
+
+    private static string CrmBadgeClass(CrmVerifyOutcome outcome) => outcome switch
+    {
+        CrmVerifyOutcome.Ok => "text-bg-success",
+        CrmVerifyOutcome.Diff => "text-bg-warning",
+        _ => "text-bg-danger",
+    };
+
+    private static string CrmLabel(CrmVerifyResult r) => r.Outcome switch
+    {
+        CrmVerifyOutcome.Ok => "通過",
+        CrmVerifyOutcome.Diff => $"不一致：{string.Join(", ", r.Diffs.Select(d => d.Field))}",
+        CrmVerifyOutcome.NotFound => "查無案件",
+        CrmVerifyOutcome.ParseFailed => "解析失敗",
+        CrmVerifyOutcome.LoginRequired => "Cookie 已失效，請至「CRM 設定」更新",
+        _ => "錯誤",
+    };
+
+    public async ValueTask DisposeAsync()
+    {
+        _crmCts?.Cancel();
+        if (!_guardSynced) return;
+        try { await JS.InvokeVoidAsync("unsavedGuard.clear"); }
+        catch (JSDisconnectedException) { }
+    }
+}

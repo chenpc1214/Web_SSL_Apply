@@ -1,0 +1,173 @@
+@page "/manual/import"
+@rendermode InteractiveServer
+@inherits ManualPageBase
+@using SslWebConsole.Models
+@using SslWebConsole.Services
+@inject CertZipImportService ImportSvc
+
+<PageTitle>步驟4 · 匯入憑證 ZIP</PageTitle>
+
+<h1 class="h3 mb-1">步驟4 · 匯入憑證 ZIP</h1>
+<p class="hint mb-1">把憑證商給的 ZIP 放進 ZipCrt 資料夾，先預覽，確認後才寫入網域資料夾。</p>
+<details class="help mb-4">
+    <summary><i class="bi bi-info-circle me-1"></i>說明</summary>
+    <p class="hint mb-0">ZIP 放在 <code>@(Workspace.IsConfigured ? Workspace.ZipDir : "")</code>。用憑證內容認網域（ZIP 檔名不重要），
+        寫出 <code>&lt;資料夾&gt;.crt</code>（主憑證）和 <code>&lt;資料夾&gt;.ca-bundle</code>（中繼憑證）。
+        寫入前會比對憑證和資料夾裡的私鑰，對不上就不寫。匯入成功的 ZIP 會刪掉；失敗、較舊的會留著。
+        ZipCrt 裡所有的 ZIP 都會處理，不限目前的品牌。</p>
+</details>
+
+<ManualBrandHeader Ready="Ready" Problem="@Problem" Brand="@Brand" />
+
+@if (Ready && Problem is null)
+{
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="d-flex gap-2 flex-wrap align-items-center">
+                <button class="btn btn-outline-primary" disabled="@_busy" @onclick="RunPreview"><i class="bi bi-search me-1"></i>預覽</button>
+                <button class="btn btn-primary" disabled="@(_busy || ImportableCount == 0)" @onclick="RequestImport">匯入（@ImportableCount）</button>
+            </div>
+
+            @if (_preview is not null)
+            {
+                @if (_preview.Count == 0)
+                {
+                    <p class="hint mt-3 mb-0">ZipCrt 裡沒有 ZIP。</p>
+                }
+                else
+                {
+                    <div class="table-responsive mt-3">
+                        <table class="table table-sm align-middle">
+                            <thead><tr><th>ZIP</th><th>網域</th><th>到期日</th><th>結果</th><th>說明</th></tr></thead>
+                            <tbody>
+                                @foreach (var item in _preview)
+                                {
+                                    <tr>
+                                        <td>@item.ZipName</td>
+                                        <td>
+                                            @item.CommonName
+                                            @if (item.CommonName is not null && !InThisBrand(item))
+                                            {
+                                                <span class="badge text-bg-light ms-1" title="這個網域不在目前品牌的 CSV 裡">其他品牌</span>
+                                            }
+                                        </td>
+                                        <td>@item.NotAfter?.ToString("yyyy-MM-dd")</td>
+                                        <td><span class="badge @StatusCss(item.Status)">@StatusLabel(item.Status)</span></td>
+                                        <td class="hint">@item.Message</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                }
+            }
+        </div>
+    </div>
+
+    <div class="card mb-4">
+        <div class="card-body">
+            <div class="section-title"><i class="bi bi-list-check me-1"></i>@Brand 的進度</div>
+            <p class="hint">依網域資料夾裡的檔案判斷。還在「等待憑證」的，就是憑證商還沒好的網域，其他網域可以先往下打包。</p>
+            <div class="table-responsive">
+                <table class="table table-sm align-middle">
+                    <thead><tr><th>CommonName</th><th>CSR</th><th>驗證檔</th><th>憑證</th><th>PFX</th></tr></thead>
+                    <tbody>
+                        @foreach (var row in PagedRows)
+                        {
+                            var hasDir = Directory.Exists(DomainDir(row));
+                            <tr>
+                                <td>@row.CommonName</td>
+                                <td>@Check(hasDir && HasFile(row, "*.csr"))</td>
+                                <td>@Check(hasDir && HasFile(row, "*.txt"))</td>
+                                <td>@Check(hasDir && HasFile(row, "*.crt"))</td>
+                                <td>@Check(hasDir && HasFile(row, "*.pfx"))</td>
+                            </tr>
+                        }
+                    </tbody>
+                </table>
+                <Pager TotalCount="Rows.Count" PageSize="PageSize" CurrentPage="CurrentPage" CurrentPageChanged="p => CurrentPage = p" />
+            </div>
+        </div>
+    </div>
+
+    @if (_log.Count > 0)
+    {
+        <div class="card mb-4">
+            <div class="card-body">
+                <div class="section-title mb-2"><i class="bi bi-terminal me-1"></i>執行紀錄</div>
+                <div class="log-panel">@string.Join("\n", _log)</div>
+            </div>
+        </div>
+    }
+}
+
+@code {
+    private List<ZipImportItem>? _preview;
+    private readonly List<string> _log = [];
+    private bool _busy;
+    private HashSet<string> _brandFolders = new(StringComparer.OrdinalIgnoreCase);
+
+    private int ImportableCount => _preview?.Count(i => i.Status is ZipImportStatus.Ready or ZipImportStatus.AlreadyImported) ?? 0;
+
+    protected override void OnBrandLoaded() =>
+        _brandFolders = Rows.Select(r => DomainFolderNaming.ToFolderName(r.CommonName)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+    private bool InThisBrand(ZipImportItem item) => item.FolderName is not null && _brandFolders.Contains(item.FolderName);
+
+    private async Task RunPreview()
+    {
+        _busy = true;
+        try { _preview = await Task.Run(() => ImportSvc.Preview()); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            _preview = null;
+            AppendLog($"預覽失敗：{ex.Message}");
+        }
+        finally { _busy = false; }
+    }
+
+    private async Task RequestImport()
+    {
+        if (_preview is null) return;
+        var targets = _preview.Where(i => i.Status is ZipImportStatus.Ready or ZipImportStatus.AlreadyImported).ToList();
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            title = $"確定要匯入 {targets.Count} 個 ZIP 嗎？",
+            text = "憑證會寫進對應的網域資料夾（取代現有的 .crt / .ca-bundle），成功的 ZIP 會被刪除。失敗、較舊的 ZIP 會留著。",
+            items = targets.Select(i => $"{i.ZipName} → {i.CommonName}").ToList(),
+            confirmText = "確定匯入",
+        });
+        if (!confirmed) return;
+
+        _busy = true;
+        try
+        {
+            var result = await Task.Run(() => ImportSvc.Import(targets));
+            foreach (var line in result.Log) AppendLog(line);
+            AppendLog($"匯入完成：寫入 {result.Imported} 個、本來就是同一張 {result.AlreadyImported} 個、刪除 ZIP {result.ZipsDeleted} 個。");
+            _preview = await Task.Run(() => ImportSvc.Preview()); // 重新預覽，剩下的就是還沒處理的 ZIP
+        }
+        finally { _busy = false; }
+    }
+
+    private void AppendLog(string message) => _log.Insert(0, $"[{DateTime.Now:HH:mm:ss}] {message}");
+
+    private static MarkupString Check(bool ok) =>
+        new(ok ? "<i class=\"bi bi-check-circle-fill text-success\"></i>" : "<span class=\"hint\">—</span>");
+
+    private static string StatusLabel(ZipImportStatus status) => status switch
+    {
+        ZipImportStatus.Ready => "可匯入",
+        ZipImportStatus.AlreadyImported => "已匯入過",
+        ZipImportStatus.SkippedOlder => "略過（較舊）",
+        _ => "失敗",
+    };
+
+    private static string StatusCss(ZipImportStatus status) => status switch
+    {
+        ZipImportStatus.Ready => "text-bg-success",
+        ZipImportStatus.AlreadyImported => "text-bg-info",
+        ZipImportStatus.SkippedOlder => "text-bg-secondary",
+        _ => "text-bg-danger",
+    };
+}

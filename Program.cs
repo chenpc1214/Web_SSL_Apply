@@ -49,6 +49,11 @@ builder.Services.AddSingleton<ReissueService>();
 builder.Services.AddSingleton<CrmSettingsRepository>();
 builder.Services.AddSingleton<CrmVerifyService>();
 builder.Services.AddSingleton<CertArchiveService>();
+// 人工模式（其他憑證商）：不存資料庫，資料在品牌 CSV、進度看網域資料夾（見 ManualWorkspace）。
+builder.Services.AddSingleton<ManualWorkspace>();
+builder.Services.AddSingleton<BrandCsvStore>();
+builder.Services.AddSingleton<CertZipImportService>();
+builder.Services.AddSingleton<ManualArchiveService>();
 
 var app = builder.Build();
 
@@ -65,6 +70,7 @@ using (var scope = app.Services.CreateScope())
         EnsureColumn(db, "Settings", "ArchiveRoot", "TEXT NOT NULL DEFAULT ''");
         EnsureColumn(db, "Domains", "OnHoldSince", "TEXT NULL");
         EnsureColumn(db, "Domains", "PendingMode", "TEXT NULL");
+        EnsureColumn(db, "Settings", "ManualWorkRoot", "TEXT NOT NULL DEFAULT ''");
     }
 
     scope.ServiceProvider.GetRequiredService<LocalityRepository>().SeedIfEmpty();
