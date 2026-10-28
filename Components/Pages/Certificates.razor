@@ -1,4 +1,5 @@
-@page "/certificates"
+@page "/renew/pfx"
+@page "/reissue/pfx"
 @rendermode InteractiveServer
 @using SslWebConsole.Models
 @using SslWebConsole.Services
@@ -7,7 +8,6 @@
 @inject PfxPasswordService PfxPasswordSvc
 @inject NicSrsConfigLoader ConfigLoader
 @inject WorkRootResolver WorkRootRes
-@inject FlowModeService FlowMode
 @inject CertArchiveService ArchiveSvc
 @inject NavigationManager Nav
 @inject IJSRuntime JS
@@ -124,7 +124,8 @@
 
     protected override void OnInitialized()
     {
-        if (FlowMode.Current is null) { Nav.NavigateTo("/"); return; }
+        // 這頁的行為跟模式無關，只擋掉網址裡沒有模式的情況（模式在 /renew/...、/reissue/... 路徑裡）。
+        if (FlowModeRoute.FromUri(Nav) is null) { Nav.NavigateTo("/"); return; }
 
         // PFX 集中輸出放在 WorkRoot 的上一層（跟 Certificates_List.csv 同一層），
         // 不是塞進 WorkRoot 裡面跟各網域工作資料夾混在一起，也不是固定在 ScriptsRoot。

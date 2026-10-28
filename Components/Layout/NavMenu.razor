@@ -1,7 +1,6 @@
 @rendermode InteractiveServer
 @implements IDisposable
 @using SslWebConsole.Services
-@inject FlowModeService FlowMode
 @inject NavigationManager Nav
 @inject IJSRuntime JS
 
@@ -31,16 +30,16 @@
         </ul>
         <hr />
 
-        @if (FlowMode.Current is null)
+        @if (CurrentMode is not { } mode)
         {
-            <p class="hint px-2" style="font-size:0.8rem;">尚未選擇模式，請先到<a href="/overview">總覽</a>選「續約」或「重發/更新」才能開始。</p>
+            <p class="hint px-2 mb-3" style="font-size:0.8rem;">尚未選擇模式，請先到<a href="/overview">總覽</a>選「續約」或「重發/更新」才能開始。</p>
         }
         else
         {
-            <div class="px-2" style="font-size:0.8rem;">
+            <div class="px-2 mb-3" style="font-size:0.8rem;">
                 <div class="d-flex align-items-center gap-1">
                     <span class="hint">目前模式：</span>
-                    <span class="mode-chip">@(FlowMode.Current == SslWebConsole.Services.FlowMode.Renew ? "續約" : "重發/更新")</span>
+                    <span class="mode-chip">@FlowModeRoute.DisplayName(mode)</span>
                     @if (!IsSwitchLocked)
                     {
                         <button class="btn btn-link p-0 align-baseline" style="font-size:0.8rem;" @onclick="ConfirmSwitch">切換</button>
@@ -54,12 +53,12 @@
         }
 
         <ul class="nav nav-pills flex-column mb-auto">
-            @{ var enabled = FlowMode.Current is not null; }
+            @{ var enabled = CurrentMode is not null; }
             <li class="nav-item d-flex align-items-center">
                 <span class="step-num me-2">1</span>
                 @if (enabled)
                 {
-                    <NavLink class="nav-link flex-fill" href="/domains">CSV 輸入 / DNS 驗證</NavLink>
+                    <NavLink class="nav-link flex-fill" href="@StepHref("domains")">CSV 輸入 / DNS 驗證</NavLink>
                 }
                 else
                 {
@@ -70,7 +69,7 @@
                 <span class="step-num me-2">2</span>
                 @if (enabled)
                 {
-                    <NavLink class="nav-link flex-fill" href="/csr">建立 CSR / Key</NavLink>
+                    <NavLink class="nav-link flex-fill" href="@StepHref("csr")">建立 CSR / Key</NavLink>
                 }
                 else
                 {
@@ -81,7 +80,7 @@
                 <span class="step-num me-2">3</span>
                 @if (enabled)
                 {
-                    <NavLink class="nav-link flex-fill" href="/order-status">@Step3Label</NavLink>
+                    <NavLink class="nav-link flex-fill" href="@StepHref("order")">@Step3Label</NavLink>
                 }
                 else
                 {
@@ -92,7 +91,7 @@
                 <span class="step-num me-2">4</span>
                 @if (enabled)
                 {
-                    <NavLink class="nav-link flex-fill" href="/webconfig-upload">web.config 放行 / 上傳驗證檔</NavLink>
+                    <NavLink class="nav-link flex-fill" href="@StepHref("upload")">web.config 放行 / 上傳驗證檔</NavLink>
                 }
                 else
                 {
@@ -103,7 +102,7 @@
                 <span class="step-num me-2">5</span>
                 @if (enabled)
                 {
-                    <NavLink class="nav-link flex-fill" href="/collect-cert">等待簽發</NavLink>
+                    <NavLink class="nav-link flex-fill" href="@StepHref("collect")">等待簽發</NavLink>
                 }
                 else
                 {
@@ -114,7 +113,7 @@
                 <span class="step-num me-2">6</span>
                 @if (enabled)
                 {
-                    <NavLink class="nav-link flex-fill" href="/certificates">整理清單 / 打包 PFX</NavLink>
+                    <NavLink class="nav-link flex-fill" href="@StepHref("pfx")">整理清單 / 打包 PFX</NavLink>
                 }
                 else
                 {
@@ -130,12 +129,61 @@
     /// 關閉（純文字，不能點）——步驟1、2還只是準備資料，不算危險，維持可以切換。
     /// NavMenu 是 Layout 的一部分，換頁不會重新建立這個元件，要自己訂閱 LocationChanged
     /// 才會跟著目前網址即時更新，不然這裡永遠停在第一次載入時的路徑。</summary>
-    private static readonly string[] LockedPaths = ["order-status", "webconfig-upload", "collect-cert", "certificates"];
+    private static readonly string[] LockedSteps = ["order", "upload", "collect", "pfx"];
 
-    private bool IsSwitchLocked => LockedPaths.Contains(Nav.ToBaseRelativePath(Nav.Uri).TrimEnd('/'));
+    private bool IsSwitchLocked
+    {
+        get
+        {
+            if (UrlMode is null) return false;
+            var segments = Nav.ToBaseRelativePath(Nav.Uri).Split(['?', '#'])[0].Trim('/').Split('/');
+            return segments.Length >= 2 && LockedSteps.Contains(segments[1].ToLowerInvariant());
+        }
+    }
 
     /// <summary>重發/更新走免費的 /ssl/replace，不會扣款，不能沿用續約的「★ 會扣款」字樣嚇到人。</summary>
-    private string Step3Label => FlowMode.Current == SslWebConsole.Services.FlowMode.Reissue ? "免費重簽／更新" : "下單（會扣款）";
+    private string Step3Label => CurrentMode == FlowMode.Reissue ? "免費重簽／更新" : "下單（會扣款）";
+
+    private const string ModeStorageKey = "flowMode";
+
+    /// <summary>這個分頁最後一次用的模式。總覽、公用設定這些頁面的網址沒有模式，靠它讓側邊欄
+    /// 延續剛才的模式；存在 sessionStorage（每個分頁各自一份），F5 重新整理也還在。</summary>
+    private FlowMode? _lastMode;
+
+    private FlowMode? UrlMode => FlowModeRoute.FromUri(Nav);
+
+    /// <summary>步驟頁以網址為準；網址沒有模式時才用這個分頁最後一次的模式。</summary>
+    private FlowMode? CurrentMode => UrlMode ?? _lastMode;
+
+    private string StepHref(string step) => CurrentMode is { } mode ? FlowModeRoute.Path(mode, step) : "/overview";
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender && await SyncLastModeAsync()) StateHasChanged();
+    }
+
+
+    /// <summary>網址有模式就記下來；沒有的話（例如剛 F5 總覽頁）從 sessionStorage 讀回來。
+    /// 回傳 _lastMode 有沒有變，有變才需要重畫。sessionStorage 不能用（例如瀏覽器封鎖）就當沒記錄。</summary>
+    private async Task<bool> SyncLastModeAsync()
+    {
+        var before = _lastMode;
+        try
+        {
+            if (UrlMode is { } urlMode)
+            {
+                _lastMode = urlMode;
+                if (before != urlMode) await JS.InvokeVoidAsync("sessionStorage.setItem", ModeStorageKey, urlMode.ToString());
+            }
+            else if (_lastMode is null)
+            {
+                var stored = await JS.InvokeAsync<string?>("sessionStorage.getItem", ModeStorageKey);
+                if (Enum.TryParse<FlowMode>(stored, out var parsed)) _lastMode = parsed;
+            }
+        }
+        catch (JSException) { }
+        return before != _lastMode;
+    }
 
     /// <summary>漢堡鈕收合狀態：預設展開；收合時面板往左縮成只剩漢堡鈕的窄條，
     /// 不是整個消失，這樣使用者隨時點得到按鈕把它叫回來。</summary>
@@ -146,7 +194,11 @@
     protected override void OnInitialized() => Nav.LocationChanged += OnLocationChanged;
 
     private void OnLocationChanged(object? sender, Microsoft.AspNetCore.Components.Routing.LocationChangedEventArgs e) =>
-        InvokeAsync(StateHasChanged);
+        InvokeAsync(async () =>
+        {
+            await SyncLastModeAsync();
+            StateHasChanged();
+        });
 
     /// <summary>「切換」不是單純的連結——先跳原生 confirm 擋一下手滑誤點，確定要換模式
     /// 才真的導去總覽；目前正在做的事（例如步驟1填到一半還沒存檔）不會被誤觸打斷。</summary>
@@ -162,5 +214,8 @@
         if (confirmed) await JS.InvokeVoidAsync("unsavedGuard.navigate", "/overview");
     }
 
-    public void Dispose() => Nav.LocationChanged -= OnLocationChanged;
+    public void Dispose()
+    {
+        Nav.LocationChanged -= OnLocationChanged;
+    }
 }

@@ -1,4 +1,5 @@
-@page "/csr"
+@page "/renew/csr"
+@page "/reissue/csr"
 @rendermode InteractiveServer
 @using SslWebConsole.Models
 @using SslWebConsole.Services
@@ -6,7 +7,6 @@
 @inject CsrService CsrSvc
 @inject CertificateOrderRepository OrderRepo
 @inject NicSrsConfigLoader ConfigLoader
-@inject FlowModeService FlowMode
 @inject NavigationManager Nav
 @inject IJSRuntime JS
 
@@ -72,14 +72,18 @@
 
     protected override void OnInitialized()
     {
-        if (FlowMode.Current is null) { Nav.NavigateTo("/"); return; }
+        // 模式從網址讀一次就固定下來——待換發的網域只顯示這個模式的（見下面的篩選）。
+        if (FlowModeRoute.FromUri(Nav) is not { } mode) { Nav.NavigateTo("/"); return; }
 
         _rows = DomainRepo.LoadAll();
-        var pendingRenewalMap = DomainRepo.LoadPendingRenewalMap();
+        var pendingModeMap = DomainRepo.LoadPendingModeMap();
         var orderMap = OrderRepo.GetLatestAll();
+        // 跟步驟1、3同一套規則：待換發的只出現在標記時選的模式（模式未定的兩邊都顯示），
+        // 其他的照原本規則，還沒下單或訂單失敗才顯示。
         _visibleRows = _rows.Where(r =>
-            pendingRenewalMap.GetValueOrDefault(r.CommonName.Trim()) ||
-            orderMap.GetValueOrDefault(r.CommonName.Trim()) is null or { Status: "Failed" }
+            pendingModeMap.TryGetValue(r.CommonName.Trim(), out var pendingMode)
+                ? pendingMode is null || pendingMode == mode
+                : orderMap.GetValueOrDefault(r.CommonName.Trim()) is null or { Status: "Failed" }
         ).ToList();
         _pageSize = ConfigLoader.Load().PageSize;
     }

@@ -5,11 +5,11 @@
 @inject DomainRepository DomainRepo
 @inject CertificateOrderRepository OrderRepo
 @inject CertificateFileRepository FileRepo
-@inject FlowModeService FlowMode
 @inject NavigationManager Nav
 @inject NicSrsConfigLoader ConfigLoader
 @inject CsrService CsrSvc
 @inject IJSRuntime JS
+@implements IAsyncDisposable
 
 <PageTitle>總覽</PageTitle>
 
@@ -33,32 +33,42 @@
     </div>
 </div>
 
-@{ var renewalGroup = PendingRenewalGroup; }
-@if (renewalGroup.Domains.Count > 0)
+@{ var renewalGroups = PendingRenewalGroups.Where(g => g.Domains.Count > 0).ToList(); }
+@if (renewalGroups.Count > 0)
 {
     <div class="card mb-4">
         <div class="card-body">
-            <div class="d-flex align-items-center gap-2 flex-wrap">
-                <div class="section-title mb-0"><i class="bi bi-arrow-repeat me-1"></i>待換發清單</div>
-                <span class="count-chip">@renewalGroup.Domains.Count</span>
-                <button class="btn btn-outline-primary btn-sm ms-auto" @onclick="() => GoToPending(renewalGroup.Href)">前往處理 <i class="bi bi-arrow-right"></i></button>
-            </div>
-            <p class="hint mt-1">已標記「準備續約/重簽」、還沒在步驟3送出的網域。</p>
-            <div class="table-responsive">
-                <table class="table table-sm mb-0">
-                    <thead><tr><th>CommonName</th><th>Organization</th><th>IP</th></tr></thead>
-                    <tbody>
-                        @foreach (var d in renewalGroup.Domains)
-                        {
-                            <tr>
-                                <td>@d.CommonName</td>
-                                <td>@d.Organization</td>
-                                <td>@d.Ip</td>
-                            </tr>
-                        }
-                    </tbody>
-                </table>
-            </div>
+            <div class="section-title"><i class="bi bi-arrow-repeat me-1"></i>待換發清單</div>
+            <p class="hint">已標記「準備續約/重簽」、還沒在步驟3送出的網域，依標記時選的模式分組。</p>
+            @foreach (var group in renewalGroups)
+            {
+                <div class="mt-3">
+                    <div class="d-flex align-items-center gap-2 mb-1 flex-wrap">
+                        <span class="fw-semibold">@group.Title</span>
+                        <span class="count-chip">@group.Domains.Count</span>
+                        <button class="btn btn-outline-primary btn-sm ms-auto" @onclick="() => GoToPending(group)">前往處理 <i class="bi bi-arrow-right"></i></button>
+                    </div>
+                    @if (group.Mode is null)
+                    {
+                        <p class="hint mb-1">舊版標記的網域，沒有記錄模式，按「前往處理」時再選。</p>
+                    }
+                    <div class="table-responsive">
+                        <table class="table table-sm mb-2">
+                            <thead><tr><th>CommonName</th><th>Organization</th><th>IP</th></tr></thead>
+                            <tbody>
+                                @foreach (var d in group.Domains)
+                                {
+                                    <tr>
+                                        <td>@d.CommonName</td>
+                                        <td>@d.Organization</td>
+                                        <td>@d.Ip</td>
+                                    </tr>
+                                }
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            }
         </div>
     </div>
 }
@@ -76,7 +86,7 @@
                     <div class="d-flex align-items-center gap-2 mb-1 flex-wrap">
                         <span class="fw-semibold">@group.Title</span>
                         <span class="count-chip">@group.Domains.Count</span>
-                        <button class="btn btn-outline-primary btn-sm ms-auto" @onclick="() => GoToPending(group.Href)">前往處理 <i class="bi bi-arrow-right"></i></button>
+                        <button class="btn btn-outline-primary btn-sm ms-auto" @onclick="() => GoToPending(group)">前往處理 <i class="bi bi-arrow-right"></i></button>
                     </div>
                     <div class="table-responsive">
                         <table class="table table-sm mb-2">
@@ -126,12 +136,13 @@
                         title="回步驟1，沿用現有訂閱（新 CSR，不用重新付費）">
                     免費重簽（@CompletedSelectedCount）
                 </button>
-                <button class="btn btn-outline-secondary btn-sm" disabled="@(SelectedCommonNames.Count() == 0)" @onclick="ExportSelected"
-                        title="覆蓋寫入 SSL_List.csv">
-                    <i class="bi bi-download me-1"></i>匯出（@SelectedCommonNames.Count()）
+                <button class="btn btn-outline-secondary btn-sm" disabled="@(VisibleCheckedRows.Count == 0)" @onclick="ExportSelected"
+                        title="覆蓋寫入 SSL_List.csv（只匯出清單上勾選的，待換發的請到步驟1匯出）">
+                    <i class="bi bi-download me-1"></i>匯出（@VisibleCheckedRows.Count）
                 </button>
-                <button class="btn btn-link btn-sm text-secondary" disabled="@(SelectedCommonNames.Count() == 0)" @onclick="ClearResume">
-                    清除勾選
+                <button class="btn btn-link btn-sm text-secondary" disabled="@(SelectedCommonNames.Count() == 0)" @onclick="ClearResume"
+                        title="清掉清單上的勾選，連同待換發清單一起清空">
+                    清除勾選@(PendingCount > 0 ? $"（含待換發 {PendingCount} 筆）" : "")
                 </button>
             </div>
         </div>
@@ -237,7 +248,8 @@
 </div>
 
 @code {
-    private sealed record PendingGroup(string Title, string Href, List<DomainRecord> Domains);
+    /// <summary>Mode 是 null 代表模式未定（只有舊版標記、又看不出模式的待換發網域），前往時跳視窗選。</summary>
+    private sealed record PendingGroup(string Title, string Step, FlowMode? Mode, List<DomainRecord> Domains);
 
     private List<DomainRecord> _rows = [];
     private string _filter = "";
@@ -245,6 +257,7 @@
 
     // ★ 整頁要用的資料在 ReloadAll() 一次撈進這三份字典，畫面一律查這裡，不再每一筆各查一次資料庫。
     private Dictionary<string, bool> _pendingRenewalMap = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, FlowMode?> _pendingModeMap = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, OrderSummary> _orderMap = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, CertFileSummary> _fileMap = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, DateTime> _holdMap = new(StringComparer.OrdinalIgnoreCase);
@@ -330,8 +343,23 @@
 
     private IEnumerable<string> SelectedCommonNames => _rows.Select(r => r.CommonName).Where(IsSelected);
 
+    /// <summary>下面清單上看得到、手動打勾的列。待換發的網域在清單上是隱藏的，看不到勾選框，
+    /// 不能算進「匯出」——不然畫面上勾 1 筆，按鈕卻寫 5 筆。</summary>
+    private List<DomainRecord> VisibleCheckedRows =>
+        _rows.Where(r => _selected.Contains(r.CommonName) && !IsPendingRenewal(r.CommonName)).ToList();
+
+    private int PendingCount => _rows.Count(r => IsPendingRenewal(r.CommonName));
+
     /// <summary>已選取的網域裡，有幾筆是「已簽發＋PFX已打包」（完全跑完，重新開始才有意義）。</summary>
-    private int CompletedSelectedCount => SelectedCommonNames.Count(IsCompleted);
+    private int CompletedSelectedCount => NewlySelectedCompleted.Count;
+
+    /// <summary>「重新開始」「免費重簽」要處理的網域：手動勾選、已完成、而且還不在待換發清單裡的。
+    /// 已經待換發的不算——它們已經從下面的清單隱藏了，算進去的話按「免費重簽」會把原本標記
+    /// 續約的網域悄悄改成重發（反之亦然）。要改模式請先在待換發清單取消，再重新標記。</summary>
+    private List<string> NewlySelectedCompleted =>
+        _rows.Select(r => r.CommonName)
+            .Where(n => _selected.Contains(n) && !IsPendingRenewal(n) && IsCompleted(n))
+            .ToList();
 
     private bool IsCompleted(string commonName)
     {
@@ -339,18 +367,37 @@
         return order is { Status: "Issued" } && CertFile(commonName) is not null;
     }
 
-    /// <summary>待處理清單的「全部前往處理」——目的地頁面沒選模式就會被彈回總覽，點下去像
-    /// 沒反應一樣，所以這裡先確保模式有值（沒選過就預設續約，待處理清單本來就是已經在跑
-    /// 正常流程的網域，續約是絕大多數情況）才真的導頁。</summary>
-    private void GoToPending(string href)
+    /// <summary>待處理清單的「前往處理」——導到這組對應模式的步驟頁。模式未定的（舊版標記）
+    /// 先跳視窗選：「重發」放在確認鈕（不扣款，視窗載不到退回原生 confirm 時也只會選到它），
+    /// 「續約」放在另一顆紅色按鈕，取消就留在總覽，絕不預設成付費的續約。</summary>
+    private async Task GoToPending(PendingGroup group)
     {
-        if (FlowMode.Current is null) FlowMode.Set(SslWebConsole.Services.FlowMode.Renew);
-        Nav.NavigateTo(href, forceLoad: true);
+        var mode = group.Mode;
+        if (mode is null)
+        {
+            var choice = await JS.InvokeAsync<string>("appDialog.choose", new
+            {
+                icon = "question",
+                title = "這些網域要用哪個模式處理？",
+                text = "舊版標記的網域沒有記錄模式。如果有的要續約、有的要重發，請分兩次處理，到步驟3只勾選該模式的網域。",
+                items = group.Domains.Select(d => d.CommonName).ToList(),
+                confirmText = "重發／更新（免費）",
+                denyText = "續約（會扣款）",
+            });
+            mode = choice switch
+            {
+                "confirm" => FlowMode.Reissue,
+                "deny" => FlowMode.Renew,
+                _ => null,
+            };
+            if (mode is null) return;
+        }
+        Nav.NavigateTo(FlowModeRoute.Path(mode.Value, group.Step), forceLoad: true);
     }
 
     /// <summary>「下一步該去哪」分組——沿用各步驟頁自己 VisibleRows 的判斷邏輯，不是另外發明
     /// 一套規則。完全跑完（IsCompleted）的不會出現在下面四組，那些留給下面完整清單處理；
-    /// 標記「正在準備續約/重簽」（PendingRenewal，見 PendingRenewalGroup）的也不會混進這
+    /// 標記「正在準備續約/重簽」（PendingRenewal，見 PendingRenewalGroups）的也不會混進這
     /// 四組——不管它本地是已完成正準備重簽，還是反查到 NicSRS 既有訂閱但本地零紀錄，都
     /// 統一在待換發清單處理，不跟這四組「還沒完成」的網域混在一起（語意不一樣）。</summary>
     private List<PendingGroup> NewCertGroups
@@ -386,10 +433,10 @@
 
             return
             [
-                new("待步驟2（建立 CSR）", "/csr", needsCsr),
-                new("待步驟3（下單／免費重簽）", "/order-status", needsOrder),
-                new("待步驟4/5（web.config 放行 / 等待簽發）", "/webconfig-upload", waitingIssuance),
-                new("待步驟6（打包 PFX）", "/certificates", needsPfx),
+                new("待步驟2（建立 CSR）", "csr", FlowMode.Renew, needsCsr),
+                new("待步驟3（下單）", "order", FlowMode.Renew, needsOrder),
+                new("待步驟4/5（web.config 放行 / 等待簽發）", "upload", FlowMode.Renew, waitingIssuance),
+                new("待步驟6（打包 PFX）", "pfx", FlowMode.Renew, needsPfx),
             ];
         }
     }
@@ -398,10 +445,52 @@
     /// 一定要有完整的 Issued+PFX 紀錄，因為反查到 NicSRS 既有訂閱、但本地完全沒處理過的
     /// 網域（見 Domains.razor 的 DoSave）一樣會被標記，也該出現在這裡而不是待申請新憑證
     /// 清單。存資料庫，不是記憶體，網站重啟也不會忘記半路做到哪。</summary>
-    private PendingGroup PendingRenewalGroup =>
-        new("待換發清單", "/order-status", _rows.Where(r => IsPendingRenewal(r.CommonName)).ToList());
+    private List<PendingGroup> PendingRenewalGroups
+    {
+        get
+        {
+            var pending = _rows.Where(r => IsPendingRenewal(r.CommonName)).ToList();
+            List<DomainRecord> InMode(FlowMode? mode) =>
+                pending.Where(r => _pendingModeMap.GetValueOrDefault(r.CommonName.Trim()) == mode).ToList();
+            return
+            [
+                new("待續約", "order", FlowMode.Renew, InMode(FlowMode.Renew)),
+                new("待重發／更新", "order", FlowMode.Reissue, InMode(FlowMode.Reissue)),
+                new("待換發（未指定模式）", "order", null, InMode(null)),
+            ];
+        }
+    }
 
     protected override void OnInitialized() => ReloadAll();
+
+    // 分頁切回來時重新載入：別的分頁在步驟1存檔、標記待換發之後，這裡才會跟著更新，不用自己按 F5。
+    private DotNetObjectReference<Overview>? _selfRef;
+    private int? _visibleListenerId;
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (!firstRender) return;
+        _selfRef = DotNetObjectReference.Create(this);
+        try { _visibleListenerId = await JS.InvokeAsync<int>("pageRefresh.onVisible", _selfRef, nameof(ReloadOnVisible)); }
+        catch (JSException) { }
+    }
+
+    [JSInvokable]
+    public Task ReloadOnVisible() => InvokeAsync(() =>
+    {
+        ReloadAll();
+        StateHasChanged();
+    });
+
+    public async ValueTask DisposeAsync()
+    {
+        if (_visibleListenerId is { } id)
+        {
+            try { await JS.InvokeVoidAsync("pageRefresh.off", id); }
+            catch (JSDisconnectedException) { } // 分頁已經關掉，監聽器也跟著消失了
+        }
+        _selfRef?.Dispose();
+    }
 
     /// <summary>
     /// 整頁需要的資料一次撈進記憶體（網域清單、待換發旗標、每個網域最新訂單、PFX 紀錄、
@@ -412,6 +501,7 @@
     {
         _rows = DomainRepo.LoadAll();
         _pendingRenewalMap = DomainRepo.LoadPendingRenewalMap();
+        _pendingModeMap = DomainRepo.LoadPendingModeMap();
         _orderMap = OrderRepo.GetLatestAll();
         _fileMap = FileRepo.GetAllByDomain();
         _holdMap = DomainRepo.LoadHoldMap();
@@ -432,33 +522,29 @@
         }
     }
 
-    /// <summary>頁面頂端的「續約/新申請」按鈕——語意上是「完全空白開始」，所以順手清掉
-    /// 待換發標記／_selected 殘留（例如之前測過「重新開始」「免費重簽」沒清乾淨），
-    /// 不然步驟1會被不相關的舊勾選狀態帶出已有的網域，跟「新網域」的期待不符。</summary>
+    /// <summary>頁面頂端的「續約/新申請」「重發/更新憑證」按鈕——只帶到對應模式的步驟1，
+    /// 不清除待換發標記。標記到步驟3送出成功才會清掉，之前沒做完的（步驟3失敗、客戶要求
+    /// 先等等）清掉的話會從待換發清單悄悄消失，容易漏掉；留著會出現在步驟1提醒使用者，
+    /// 這次不處理的按「移出清單」即可。每個網域記錄自己的模式，另一個模式的標記不會跑進來。</summary>
     private void StartRenewFresh()
     {
-        DomainRepo.ClearAllPendingRenewal();
         _selected.Clear();
-        FlowMode.Set(SslWebConsole.Services.FlowMode.Renew);
-        Nav.NavigateTo("/domains", forceLoad: true);
+        Nav.NavigateTo(FlowModeRoute.Path(FlowMode.Renew, "domains"), forceLoad: true);
     }
 
     private void StartReissueFresh()
     {
-        DomainRepo.ClearAllPendingRenewal();
         _selected.Clear();
-        FlowMode.Set(SslWebConsole.Services.FlowMode.Reissue);
-        Nav.NavigateTo("/domains", forceLoad: true);
+        Nav.NavigateTo(FlowModeRoute.Path(FlowMode.Reissue, "domains"), forceLoad: true);
     }
 
     private void StartOver()
     {
-        var completed = SelectedCommonNames.Where(IsCompleted).ToList();
+        var completed = NewlySelectedCompleted;
         if (completed.Count > 0)
         {
-            foreach (var name in completed) DomainRepo.SetPendingRenewal(name, true);
-            FlowMode.Set(SslWebConsole.Services.FlowMode.Renew);
-            Nav.NavigateTo("/domains", forceLoad: true);
+            foreach (var name in completed) DomainRepo.SetPendingRenewal(name, true, FlowMode.Renew);
+            Nav.NavigateTo(FlowModeRoute.Path(FlowMode.Renew, "domains"), forceLoad: true);
         }
     }
 
@@ -466,12 +552,11 @@
     /// IP、FTP 這些資料，跟續約走同一個起點，只是步驟1~3 的畫面會依模式跟著調整。</summary>
     private void StartReissue()
     {
-        var completed = SelectedCommonNames.Where(IsCompleted).ToList();
+        var completed = NewlySelectedCompleted;
         if (completed.Count > 0)
         {
-            foreach (var name in completed) DomainRepo.SetPendingRenewal(name, true);
-            FlowMode.Set(SslWebConsole.Services.FlowMode.Reissue);
-            Nav.NavigateTo("/domains", forceLoad: true);
+            foreach (var name in completed) DomainRepo.SetPendingRenewal(name, true, FlowMode.Reissue);
+            Nav.NavigateTo(FlowModeRoute.Path(FlowMode.Reissue, "domains"), forceLoad: true);
         }
     }
 
@@ -485,6 +570,7 @@
         DomainRepo.ClearAllPendingRenewal();
         _selected.Clear();
         _pendingRenewalMap = DomainRepo.LoadPendingRenewalMap();
+        _pendingModeMap = DomainRepo.LoadPendingModeMap();
     }
 
     /// <summary>
@@ -493,7 +579,7 @@
     /// </summary>
     private async Task ExportSelected()
     {
-        var rows = _rows.Where(r => IsSelected(r.CommonName)).ToList();
+        var rows = VisibleCheckedRows;
         if (rows.Count == 0) return;
 
         var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new

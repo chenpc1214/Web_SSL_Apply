@@ -1,4 +1,5 @@
-@page "/domains"
+@page "/renew/domains"
+@page "/reissue/domains"
 @rendermode InteractiveServer
 @implements IAsyncDisposable
 @using SslWebConsole.Models
@@ -11,7 +12,6 @@
 @inject ValidationUploadService FtpSvc
 @inject CertificateOrderRepository OrderRepo
 @inject NicSrsConfigLoader ConfigLoader
-@inject FlowModeService FlowMode
 @inject NavigationManager Nav
 @inject IJSRuntime JS
 
@@ -84,7 +84,13 @@
                                     }
                                 </select>
                             </td>
-                            <td class="text-end"><button class="btn-icon danger" title="刪除" @onclick="() => RequestDelete(row)"><i class="bi bi-trash"></i></button></td>
+                            <td class="text-end text-nowrap">
+                                @if (IsPendingHere(row))
+                                {
+                                    <button class="btn-icon" title="移出清單（只取消待換發標記，資料保留）" @onclick="() => RequestRemoveFromList(row)"><i class="bi bi-box-arrow-left"></i></button>
+                                }
+                                <button class="btn-icon danger" title="@(_unsavedRows.Contains(row) ? "移除這一列（還沒存檔，不會動到資料庫）" : "刪除")" @onclick="() => RequestDelete(row)"><i class="bi bi-trash"></i></button>
+                            </td>
                         </tr>
                     }
                 </tbody>
@@ -256,6 +262,10 @@
     /// 它的 CommonName 打完後查出來是不是已經 Issued 的舊網域，都要在這頁繼續顯示，讓使用者
     /// 有機會編輯完、按到「儲存」，不能讓它一填完名稱就從畫面上直接消失。</summary>
     private readonly HashSet<DomainRecord> _editingRows = new();
+    /// <summary>這次頁面手動新增/匯入、還沒按過「儲存」的列。刪除這種列只從畫面移除，不碰資料庫——
+    /// 打了一個已存在的網域名稱會自動帶入舊資料，這時按垃圾桶如果真的去刪資料庫，會連同那個網域的
+    /// 訂單紀錄一起刪掉。</summary>
+    private readonly HashSet<DomainRecord> _unsavedRows = new();
     private List<LocalityOption> _localities = [];
     private List<DnsCheckResult>? _dnsResults;
     private string _saveMessage = "";
@@ -269,7 +279,8 @@
     private readonly List<ValidationUploadResult> _ftpResults = [];
     private bool _ftpChecking;
 
-    private bool IsReissueMode => FlowMode.Current == SslWebConsole.Services.FlowMode.Reissue;
+    private SslWebConsole.Services.FlowMode _mode;
+    private bool IsReissueMode => _mode == SslWebConsole.Services.FlowMode.Reissue;
 
     /// <summary>
     /// 預設只顯示尚未下單／訂單失敗的網域（這頁定位是「這次要處理的新資料」），已下單的
@@ -281,13 +292,20 @@
         _rows.Where(r =>
             string.IsNullOrWhiteSpace(r.CommonName) ||
             _editingRows.Contains(r) ||
-            _pendingRenewalMap.GetValueOrDefault(r.CommonName.Trim()) ||
-            LatestOrder(r.CommonName) is null or { Status: "Failed" }
+            BelongsToThisMode(r)
         ).ToList();
+
+    /// <summary>待換發的網域只出現在標記時選的那個模式（模式未定的舊標記兩邊都顯示，到步驟3再自己挑），
+    /// 不然續約、重發兩邊會混在一起；沒有待換發標記的照原本規則：還沒下單或訂單失敗才顯示。</summary>
+    private bool BelongsToThisMode(DomainRecord r) =>
+        _pendingModeMap.TryGetValue(r.CommonName.Trim(), out var pendingMode)
+            ? pendingMode is null || pendingMode == _mode
+            : LatestOrder(r.CommonName) is null or { Status: "Failed" };
 
     // ★ 訂單狀態、續約標記一次撈進字典，畫面一律查這裡——這頁每個輸入框改完都會重繪，
     // 不能每次重繪都對每一列各查一次資料庫。存檔（會改續約標記）之後才用 ReloadStatusMaps() 重撈。
     private Dictionary<string, bool> _pendingRenewalMap = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, SslWebConsole.Services.FlowMode?> _pendingModeMap = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, OrderSummary> _orderMap = new(StringComparer.OrdinalIgnoreCase);
 
     private OrderSummary? LatestOrder(string commonName) => _orderMap.GetValueOrDefault(commonName.Trim());
@@ -295,6 +313,7 @@
     private void ReloadStatusMaps()
     {
         _pendingRenewalMap = DomainRepo.LoadPendingRenewalMap();
+        _pendingModeMap = DomainRepo.LoadPendingModeMap();
         _orderMap = OrderRepo.GetLatestAll();
     }
 
@@ -305,7 +324,9 @@
 
     protected override void OnInitialized()
     {
-        if (FlowMode.Current is null) { Nav.NavigateTo("/"); return; }
+        // 模式從網址讀一次就固定下來，之後按鈕一律用 _mode——不會因為別的分頁切換模式而變。
+        if (FlowModeRoute.FromUri(Nav) is not { } mode) { Nav.NavigateTo("/"); return; }
+        _mode = mode;
 
         _localities = LocalityRepo.GetAllOptions();
         _rows = DomainRepo.LoadAll();
@@ -356,6 +377,7 @@
         var row = new DomainRecord();
         _rows.Add(row);
         _editingRows.Add(row);
+        _unsavedRows.Add(row);
     }
 
     /// <summary>CommonName 打完（欄位失焦）後，Organization 還空著就依網域自動帶一個猜測值——
@@ -404,11 +426,43 @@
         return first;
     }
 
+    /// <summary>這列是不是這個模式的待換發網域（模式未定的舊標記也算）——只有這種才有「移出清單」。</summary>
+    private bool IsPendingHere(DomainRecord row) =>
+        !string.IsNullOrWhiteSpace(row.CommonName) &&
+        !_unsavedRows.Contains(row) &&
+        _pendingModeMap.TryGetValue(row.CommonName.Trim(), out var pendingMode) &&
+        (pendingMode is null || pendingMode == _mode);
+
+    /// <summary>「移出清單」：選錯網域時用，只取消待換發標記，網域資料、訂單紀錄都保留，
+    /// 之後在總覽重新勾選就能再加回來。已簽發的網域取消標記後就不符合這頁的顯示條件，自然消失。</summary>
+    private async Task RequestRemoveFromList(DomainRecord row)
+    {
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            title = $"把「{row.CommonName}」移出這次的清單嗎？",
+            text = "只取消待換發標記，網域資料和訂單紀錄都會保留，之後可以在總覽重新勾選。",
+            confirmText = "移出清單",
+        });
+        if (!confirmed) return;
+
+        var name = row.CommonName.Trim();
+        DomainRepo.SetPendingRenewal(name, false);
+        ReloadStatusMaps();
+        // 同名的列（例如打名稱自動帶入的那列）一起不再強制顯示，不然取消標記後還會留在畫面上
+        _editingRows.RemoveWhere(r => string.Equals(r.CommonName.Trim(), name, StringComparison.OrdinalIgnoreCase));
+        _saveMessage = $"已把「{name}」移出清單（資料保留），{DateTime.Now:HH:mm:ss}";
+        _pendingRenewalCount = 0; // 上次存檔留下的「已標記待換發」提示已經不成立，不能繼續掛在畫面上
+        EnsureAtLeastOneRow();
+    }
+
     private async Task RequestDelete(DomainRecord row)
     {
-        if (string.IsNullOrWhiteSpace(row.CommonName))
+        if (string.IsNullOrWhiteSpace(row.CommonName) || _unsavedRows.Contains(row))
         {
-            _rows.Remove(row); // 新增但還沒填的空白列，不用確認直接刪
+            // 空白列、或這次新增/匯入還沒存檔的列：只從畫面移除，不碰資料庫（見 _unsavedRows 的說明）
+            _rows.Remove(row);
+            _editingRows.Remove(row);
+            _unsavedRows.Remove(row);
             EnsureAtLeastOneRow();
             return;
         }
@@ -426,6 +480,7 @@
         DomainRepo.Delete(row.CommonName);
         _orderMap.Remove(row.CommonName.Trim()); // Delete 連訂單一起刪了，同名重新新增時不能被當成舊網域
         _pendingRenewalMap.Remove(row.CommonName.Trim());
+        _pendingModeMap.Remove(row.CommonName.Trim());
         _rows.Remove(row);
         EnsureAtLeastOneRow();
     }
@@ -437,7 +492,36 @@
         if (VisibleRows.Count == 0) AddRow();
     }
 
-    private Task RequestSave() => RequestConfirmedAction(DoSave, isExport: false);
+    private async Task RequestSave()
+    {
+        // 已經是另一個模式待換發的網域（例如從 CSV 匯入、或手動打名稱自動帶入），存檔會被
+        // 標記成這頁的模式——待重發的網域就這樣變成待續約，跑進會扣款的下單頁。整批擋下，
+        // 不做部分存檔，讓使用者先處理掉這幾筆再存。
+        var conflicts = VisibleRows
+            .Select(r => r.CommonName.Trim())
+            .Where(n => n.Length > 0 &&
+                        _pendingModeMap.TryGetValue(n, out var pendingMode) &&
+                        pendingMode is { } m && m != _mode)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (conflicts.Count > 0)
+        {
+            var otherMode = _mode == SslWebConsole.Services.FlowMode.Renew ? "待重發／更新" : "待續約";
+            await JS.InvokeAsync<bool>("appDialog.confirm", new
+            {
+                icon = "error",
+                title = "有網域已經在另一個模式的待換發清單",
+                text = $"下面這些網域已經在總覽的「{otherMode}」清單裡，不能在這個模式存檔（存了會改掉它的模式）。"
+                    + "請先把這幾列從畫面移除；如果真的要換模式，先到另一個模式的步驟1按「移出清單」，再回來重新加入。",
+                items = conflicts,
+                confirmText = "知道了",
+                cancelText = "關閉",
+            });
+            return;
+        }
+
+        await RequestConfirmedAction(DoSave, isExport: false);
+    }
 
     private Task RequestExportCsv() => RequestConfirmedAction(() => { DoExportCsv(); return Task.CompletedTask; }, isExport: true);
 
@@ -508,6 +592,11 @@
         // 只傳可見子集合是安全的。
         var visibleRows = VisibleRows.Where(r => !string.IsNullOrWhiteSpace(r.CommonName)).ToList();
         DomainRepo.SaveAll(visibleRows);
+        _unsavedRows.ExceptWith(visibleRows);
+        // 打名稱自動帶入舊網域的那列存檔後，開頁時載入的同名舊物件也會因為變成待換發而顯示，
+        // 畫面上就出現兩列同一個網域。舊物件的內容已經被剛存的那列取代，從記憶體拿掉（不動資料庫）。
+        var savedNames = visibleRows.Select(r => r.CommonName.Trim()).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        _rows.RemoveAll(r => !visibleRows.Contains(r) && savedNames.Contains(r.CommonName.Trim()));
 
         _pendingRenewalCount = 0;
 
@@ -516,7 +605,7 @@
             var order = LatestOrder(row.CommonName);
             if (order is { Status: "Issued" } || (order is null && IsReissueMode))
             {
-                DomainRepo.SetPendingRenewal(row.CommonName, true);
+                DomainRepo.SetPendingRenewal(row.CommonName, true, _mode);
                 _pendingRenewalCount++;
             }
         }
@@ -568,6 +657,7 @@
                 updated++;
             }
             _editingRows.Add(record); // 匯入的這幾筆這次頁面存活期間都要維持可見，理由同 AddRow()
+            _unsavedRows.Add(record);
         }
 
         _page = 1;

@@ -20,6 +20,11 @@ public sealed class DomainEntity
     /// <summary>網域已經是已完成狀態，但正在準備續約/重簽（存過新資料、還沒真的送出步驟3的
     /// 動作）——特意存資料庫、不是放記憶體，這樣網站程式重啟也不會忘記半路做到哪。</summary>
     public bool PendingRenewal { get; set; }
+    /// <summary>標記待換發時選的模式（"Renew"／"Reissue"），只在 PendingRenewal=true 時有值。
+    /// 總覽頁靠它把待換發清單拆成「待續約」「待重發」，按下去直接到對應模式的步驟3。
+    /// 改版前標記的網域是 null，見 DomainRepository.LoadPendingModeMap 的推斷規則。
+    /// 既有資料庫沒有這個欄位，由 Program.cs 啟動時補上。</summary>
+    public string? PendingMode { get; set; }
     /// <summary>步驟5「暫緩」的標記時間，null＝沒有暫緩。用在客戶那邊卡住、短期內不會簽發的網域
     /// （例如 Cloudflare 擋住檔案驗證）：步驟5開頁預設不勾選、輪詢跳過；步驟6封存一律略過。
     /// 既有資料庫沒有這個欄位，由 Program.cs 啟動時補上。</summary>

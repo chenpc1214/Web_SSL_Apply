@@ -1,0 +1,14 @@
+@page "/domains"
+@page "/csr"
+@page "/order-status"
+@page "/webconfig-upload"
+@page "/collect-cert"
+@page "/certificates"
+@inject NavigationManager Nav
+
+@* 改版前的步驟網址沒有模式（模式改放在 /renew/...、/reissue/... 路徑裡），
+   舊書籤點進來一律導回總覽重新選模式，不猜是續約還是重發。 *@
+
+@code {
+    protected override void OnInitialized() => Nav.NavigateTo("/overview", replace: true);
+}

@@ -1,3 +1,5 @@
+using Microsoft.AspNetCore.Components;
+
 namespace SslWebConsole.Services;
 
 public enum FlowMode
@@ -10,15 +12,34 @@ public enum FlowMode
 }
 
 /// <summary>
-/// 記錄「目前是續約還是重發/更新模式」，供側邊欄跟步驟1~6頁面共用。單例——這是單一操作者
-/// 用的內部工具，不用每個瀏覽器分頁各自獨立狀態。
-/// 沒選過模式（Current 是 null）時，側邊欄的步驟1~6連結不開放，頁面本身也會擋掉直接網址存取。
+/// 模式放在網址路徑的第一段（/renew/...、/reissue/...），不是存在全站共用的單例裡——
+/// 單例的話，分頁 B 在總覽切換模式，分頁 A 還停在步驟3的畫面一按下去就會用錯模式
+/// （例如本來要免費重簽，變成付費下單）。放在網址裡每個分頁各自獨立，F5 也不會丟失。
+/// 步驟頁在 OnInitialized 讀一次就固定下來，之後按鈕一律用那個值。
 /// </summary>
-public sealed class FlowModeService
+public static class FlowModeRoute
 {
-    public FlowMode? Current { get; private set; }
+    public const string RenewSegment = "renew";
+    public const string ReissueSegment = "reissue";
 
-    public void Set(FlowMode mode) => Current = mode;
+    /// <summary>從目前網址讀出模式；第一段不是 renew/reissue（例如總覽、公用設定）就回 null。</summary>
+    public static FlowMode? FromUri(NavigationManager nav)
+    {
+        var path = nav.ToBaseRelativePath(nav.Uri);
+        var end = path.IndexOfAny(['/', '?', '#']);
+        var first = end < 0 ? path : path[..end];
+        return first.ToLowerInvariant() switch
+        {
+            RenewSegment => FlowMode.Renew,
+            ReissueSegment => FlowMode.Reissue,
+            _ => null,
+        };
+    }
 
-    public void Clear() => Current = null;
+    /// <summary>某個模式下某個步驟的網址，step 例如 "domains"、"order"。</summary>
+    public static string Path(FlowMode mode, string step) =>
+        $"/{(mode == FlowMode.Reissue ? ReissueSegment : RenewSegment)}/{step}";
+
+    /// <summary>給畫面顯示用的模式名稱。</summary>
+    public static string DisplayName(FlowMode mode) => mode == FlowMode.Reissue ? "重發/更新" : "續約";
 }

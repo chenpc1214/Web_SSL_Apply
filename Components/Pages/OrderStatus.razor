@@ -1,4 +1,5 @@
-@page "/order-status"
+@page "/renew/order"
+@page "/reissue/order"
 @rendermode InteractiveServer
 @implements IAsyncDisposable
 @using SslWebConsole.Models
@@ -10,7 +11,6 @@
 @inject CsrService CsrSvc
 @inject CertificateOrderRepository OrderRepo
 @inject ReissueService ReissueSvc
-@inject FlowModeService FlowMode
 @inject NavigationManager Nav
 @inject IJSRuntime JS
 
@@ -249,13 +249,20 @@ else
     /// </summary>
     private List<DomainRecord> VisibleRows =>
         _rows.Where(r =>
-            _pendingRenewalMap.GetValueOrDefault(r.CommonName.Trim()) ||
-            LatestOrder(r.CommonName) is null or { Status: "Failed" }
+            BelongsToThisMode(r)
         ).ToList();
+
+    /// <summary>待換發的網域只出現在標記時選的那個模式（模式未定的舊標記兩邊都顯示，到步驟3再自己挑），
+    /// 不然續約、重發兩邊會混在一起；沒有待換發標記的照原本規則：還沒下單或訂單失敗才顯示。</summary>
+    private bool BelongsToThisMode(DomainRecord r) =>
+        _pendingModeMap.TryGetValue(r.CommonName.Trim(), out var pendingMode)
+            ? pendingMode is null || pendingMode == _mode
+            : LatestOrder(r.CommonName) is null or { Status: "Failed" };
 
     // ★ 訂單狀態、續約標記一次撈進字典，畫面一律查這裡，不再每一列各查一次資料庫；
     // 下單/重簽之後（狀態可能變了）才用 ReloadStatusMaps() 重撈。
     private Dictionary<string, bool> _pendingRenewalMap = new(StringComparer.OrdinalIgnoreCase);
+    private Dictionary<string, SslWebConsole.Services.FlowMode?> _pendingModeMap = new(StringComparer.OrdinalIgnoreCase);
     private Dictionary<string, OrderSummary> _orderMap = new(StringComparer.OrdinalIgnoreCase);
 
     private OrderSummary? LatestOrder(string commonName) => _orderMap.GetValueOrDefault(commonName.Trim());
@@ -263,6 +270,7 @@ else
     private void ReloadStatusMaps()
     {
         _pendingRenewalMap = DomainRepo.LoadPendingRenewalMap();
+        _pendingModeMap = DomainRepo.LoadPendingModeMap();
         _orderMap = OrderRepo.GetLatestAll();
     }
 
@@ -271,14 +279,17 @@ else
     private int _page = 1;
     private List<DomainRecord> PagedRows => VisibleRows.Skip((_page - 1) * PageSize).Take(PageSize).ToList();
 
-    private bool IsReissueMode => FlowMode.Current == SslWebConsole.Services.FlowMode.Reissue;
+    private SslWebConsole.Services.FlowMode _mode;
+    private bool IsReissueMode => _mode == SslWebConsole.Services.FlowMode.Reissue;
 
     /// <summary>批次卡片、紀錄訊息共用的動作名稱，兩種模式走同一套批次流程只差在這個字。</summary>
     private string ActionName => IsReissueMode ? "重簽" : "下單";
 
     protected override void OnInitialized()
     {
-        if (FlowMode.Current is null) { Nav.NavigateTo("/"); return; }
+        // 模式從網址讀一次就固定下來，之後按鈕一律用 _mode——不會因為別的分頁切換模式而變。
+        if (FlowModeRoute.FromUri(Nav) is not { } mode) { Nav.NavigateTo("/"); return; }
+        _mode = mode;
 
         _rows = DomainRepo.LoadAll();
         ReloadStatusMaps();

@@ -1,4 +1,5 @@
-@page "/collect-cert"
+@page "/renew/collect"
+@page "/reissue/collect"
 @rendermode InteractiveServer
 @implements IDisposable
 @using SslWebConsole.Models
@@ -7,7 +8,6 @@
 @inject CertCollectService CollectSvc
 @inject CertificateOrderRepository OrderRepo
 @inject NicSrsConfigLoader ConfigLoader
-@inject FlowModeService FlowMode
 @inject OrderStatusService OrderStatusSvc
 @inject CsrService CsrSvc
 @inject NavigationManager Nav
@@ -107,7 +107,8 @@
 
     protected override void OnInitialized()
     {
-        if (FlowMode.Current is null) { Nav.NavigateTo("/"); return; }
+        // 這頁的行為跟模式無關，只擋掉網址裡沒有模式的情況（模式在 /renew/...、/reissue/... 路徑裡）。
+        if (FlowModeRoute.FromUri(Nav) is null) { Nav.NavigateTo("/"); return; }
 
         _rows = DomainRepo.LoadAll();
         ReloadOrders();

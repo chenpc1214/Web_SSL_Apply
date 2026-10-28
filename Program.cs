@@ -48,7 +48,6 @@ builder.Services.AddSingleton<PlaceOrderService>();
 builder.Services.AddSingleton<ReissueService>();
 builder.Services.AddSingleton<CrmSettingsRepository>();
 builder.Services.AddSingleton<CrmVerifyService>();
-builder.Services.AddSingleton<FlowModeService>();
 builder.Services.AddSingleton<CertArchiveService>();
 
 var app = builder.Build();
@@ -65,6 +64,7 @@ using (var scope = app.Services.CreateScope())
         // 部署到既有的 sslautomation.db 不用手動跑 ALTER TABLE。
         EnsureColumn(db, "Settings", "ArchiveRoot", "TEXT NOT NULL DEFAULT ''");
         EnsureColumn(db, "Domains", "OnHoldSince", "TEXT NULL");
+        EnsureColumn(db, "Domains", "PendingMode", "TEXT NULL");
     }
 
     scope.ServiceProvider.GetRequiredService<LocalityRepository>().SeedIfEmpty();

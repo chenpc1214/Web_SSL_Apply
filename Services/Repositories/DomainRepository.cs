@@ -135,14 +135,35 @@ public sealed class DomainRepository
         return map;
     }
 
-    /// <summary>設定/清除「正在準備續約/重簽」標記。找不到這個網域就靜默不做事（可能剛好被刪除）。</summary>
-    public void SetPendingRenewal(string commonName, bool value)
+    /// <summary>設定/清除「正在準備續約/重簽」標記。找不到這個網域就靜默不做事（可能剛好被刪除）。
+    /// 設定時一併記下模式；清除時模式也清掉，資料庫裡不留過時的值。</summary>
+    public void SetPendingRenewal(string commonName, bool value, FlowMode? mode = null)
     {
         using var db = _dbFactory.CreateDbContext();
         var entity = FindByName(db, commonName);
         if (entity is null) return;
         entity.PendingRenewal = value;
+        entity.PendingMode = value ? mode?.ToString() : null;
         db.SaveChanges();
+    }
+
+    /// <summary>
+    /// 一次撈回全部待換發網域的模式，key 是 CommonName（不分大小寫），value 是 null 代表無法判斷。
+    /// 改版前標記的網域沒有記錄模式：ProductCode 或 Years 是空的一定是重發（續約下單必填這兩欄），
+    /// 兩欄都有值就分不出來（重發模式只是把欄位藏起來，不會清空），交給總覽頁跳視窗讓使用者選。
+    /// </summary>
+    public Dictionary<string, FlowMode?> LoadPendingModeMap()
+    {
+        using var db = _dbFactory.CreateDbContext();
+        var map = new Dictionary<string, FlowMode?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var e in db.Domains.AsNoTracking().Where(e => e.PendingRenewal).ToList())
+        {
+            FlowMode? mode = Enum.TryParse<FlowMode>(e.PendingMode, out var parsed) ? parsed : null;
+            if (mode is null && (string.IsNullOrWhiteSpace(e.ProductCode) || string.IsNullOrWhiteSpace(e.Years)))
+                mode = FlowMode.Reissue;
+            map[e.CommonName.Trim()] = mode;
+        }
+        return map;
     }
 
     /// <summary>一次撈回全部「暫緩中」的網域跟標記時間，key 是 CommonName（不分大小寫）。</summary>
@@ -171,7 +192,11 @@ public sealed class DomainRepository
     {
         using var db = _dbFactory.CreateDbContext();
         var flagged = db.Domains.Where(e => e.PendingRenewal).ToList();
-        foreach (var e in flagged) e.PendingRenewal = false;
+        foreach (var e in flagged)
+        {
+            e.PendingRenewal = false;
+            e.PendingMode = null;
+        }
         db.SaveChanges();
     }
 
