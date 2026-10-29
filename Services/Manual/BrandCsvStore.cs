@@ -34,6 +34,30 @@ public sealed class BrandCsvStore
         return new BrandCsvSnapshot(brand, rows, File.GetLastWriteTimeUtc(path), encoding);
     }
 
+    /// <summary>
+    /// 在網頁上直接建立一個新品牌：BrandCsv 底下產生一個只有標題列的 CSV（UTF-8 帶 BOM，
+    /// 跟 SSL_List.csv 一樣，Excel 打開中文不會亂碼）。名稱不合法或已經存在時回傳原因，成功回 null。
+    /// </summary>
+    public string? Create(string brand)
+    {
+        brand = brand.Trim();
+        if (brand.Length == 0) return "請輸入品牌名稱。";
+        if (brand.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || brand.Contains('.'))
+            return "品牌名稱不能有 \\ / : * ? \" < > | 或句點。";
+        if (brand.EndsWith(ManualWorkspace.CompletedSuffix, StringComparison.OrdinalIgnoreCase))
+            return $"名稱不能以「{ManualWorkspace.CompletedSuffix}」結尾（那是封存紀錄檔用的）。";
+
+        var path = _workspace.BrandCsvPath(brand);
+        if (File.Exists(path)) return $"{brand}.csv 已經存在。";
+
+        Directory.CreateDirectory(_workspace.BrandCsvDir);
+        using var writer = new StreamWriter(path, false, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
+        using var csv = new CsvWriter(writer, new CsvConfiguration(CultureInfo.InvariantCulture));
+        csv.WriteHeader<DomainRecord>();
+        csv.NextRecord();
+        return null;
+    }
+
     /// <summary>覆蓋寫回品牌 CSV。回傳新的快照（修改時間更新了，下一次存檔要用它比對）。</summary>
     public BrandCsvSnapshot Save(BrandCsvSnapshot loaded, IEnumerable<DomainRecord> rows)
     {

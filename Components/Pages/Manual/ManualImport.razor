@@ -14,7 +14,7 @@
     <p class="hint mb-0">ZIP 放在 <code>@(Workspace.IsConfigured ? Workspace.ZipDir : "")</code>。用憑證內容認網域（ZIP 檔名不重要），
         寫出 <code>&lt;資料夾&gt;.crt</code>（主憑證）和 <code>&lt;資料夾&gt;.ca-bundle</code>（中繼憑證）。
         寫入前會比對憑證和資料夾裡的私鑰，對不上就不寫。匯入成功的 ZIP 會刪掉；失敗、較舊的會留著。
-        ZipCrt 裡所有的 ZIP 都會處理，不限目前的品牌。</p>
+        只會列出、匯入目前品牌的網域；其他品牌的 ZIP 留在 ZipCrt，切換到那個品牌再處理。</p>
 </details>
 
 <ManualBrandHeader Ready="Ready" Problem="@Problem" Brand="@Brand" />
@@ -30,9 +30,15 @@
 
             @if (_preview is not null)
             {
-                @if (_preview.Count == 0)
+                var visible = VisibleItems;
+                var otherCount = _preview.Count - visible.Count;
+                @if (otherCount > 0)
                 {
-                    <p class="hint mt-3 mb-0">ZipCrt 裡沒有 ZIP。</p>
+                    <p class="hint mt-3 mb-0"><i class="bi bi-info-circle me-1"></i>另有 @otherCount 個 ZIP 屬於其他品牌，沒有列出，也不會匯入；切換到那個品牌再處理。</p>
+                }
+                @if (visible.Count == 0)
+                {
+                    <p class="hint mt-3 mb-0">ZipCrt 裡沒有 @Brand 的 ZIP。</p>
                 }
                 else
                 {
@@ -40,15 +46,18 @@
                         <table class="table table-sm align-middle">
                             <thead><tr><th>ZIP</th><th>網域</th><th>到期日</th><th>結果</th><th>說明</th></tr></thead>
                             <tbody>
-                                @foreach (var item in _preview)
+                                @foreach (var item in visible)
                                 {
                                     <tr>
                                         <td>@item.ZipName</td>
                                         <td>
-                                            @item.CommonName
-                                            @if (item.CommonName is not null && !InThisBrand(item))
+                                            @if (item.CommonName is null)
                                             {
-                                                <span class="badge text-bg-light ms-1" title="這個網域不在目前品牌的 CSV 裡">其他品牌</span>
+                                                <span class="hint" title="ZIP 讀不了或裡面沒有憑證，看不出是哪個網域">（無法判斷）</span>
+                                            }
+                                            else
+                                            {
+                                                @item.CommonName
                                             }
                                         </td>
                                         <td>@item.NotAfter?.ToString("yyyy-MM-dd")</td>
@@ -107,12 +116,25 @@
     private bool _busy;
     private HashSet<string> _brandFolders = new(StringComparer.OrdinalIgnoreCase);
 
-    private int ImportableCount => _preview?.Count(i => i.Status is ZipImportStatus.Ready or ZipImportStatus.AlreadyImported) ?? 0;
+    /// <summary>只處理目前品牌的 ZIP：網域在這個品牌 CSV 裡的才列出、才匯入。讀不了的 ZIP 看不出網域，
+    /// 也列出來（不然使用者不知道有壞掉的檔案），但本來就不會被匯入。</summary>
+    private List<ZipImportItem> VisibleItems =>
+        _preview?.Where(i => InThisBrand(i) || i.CommonName is null).ToList() ?? [];
+
+    private List<ZipImportItem> ImportableItems =>
+        VisibleItems.Where(i => InThisBrand(i) && (i.Status is ZipImportStatus.Ready or ZipImportStatus.AlreadyImported)).ToList();
+
+    private int ImportableCount => ImportableItems.Count;
 
     protected override void OnBrandLoaded() =>
         _brandFolders = Rows.Select(r => DomainFolderNaming.ToFolderName(r.CommonName)).ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-    private bool InThisBrand(ZipImportItem item) => item.FolderName is not null && _brandFolders.Contains(item.FolderName);
+    /// <summary>找到資料夾的用資料夾名稱比；找不到資料夾（失敗）的用憑證 CN 換算的資料夾名稱比。</summary>
+    private bool InThisBrand(ZipImportItem item)
+    {
+        var folder = item.FolderName ?? (item.CommonName is null ? null : DomainFolderNaming.ToFolderName(item.CommonName));
+        return folder is not null && _brandFolders.Contains(folder);
+    }
 
     private async Task RunPreview()
     {
@@ -129,7 +151,7 @@
     private async Task RequestImport()
     {
         if (_preview is null) return;
-        var targets = _preview.Where(i => i.Status is ZipImportStatus.Ready or ZipImportStatus.AlreadyImported).ToList();
+        var targets = ImportableItems;
         var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
         {
             title = $"確定要匯入 {targets.Count} 個 ZIP 嗎？",

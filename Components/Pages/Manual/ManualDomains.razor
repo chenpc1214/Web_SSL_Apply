@@ -41,7 +41,7 @@ else
             <div class="section-title"><i class="bi bi-tags me-1"></i>品牌</div>
             @if (_brands.Count == 0)
             {
-                <p class="hint mb-0">還沒有品牌 CSV。請把 CSV（例如 A_Brand.csv）放到 <code>@Workspace.BrandCsvDir</code>，再按「重新整理清單」。</p>
+                <p class="hint mb-0">還沒有品牌。可以在下面直接新增一個，或把現成的 CSV（例如 A_Brand.csv）放到 <code>@Workspace.BrandCsvDir</code> 再按「重新整理清單」。</p>
                 <button class="btn btn-outline-secondary btn-sm mt-2" @onclick="RefreshBrands">重新整理清單</button>
             }
             else
@@ -57,6 +57,11 @@ else
                     <button class="btn btn-outline-secondary btn-sm" @onclick="RefreshBrands">重新整理清單</button>
                 </div>
             }
+            <div class="d-flex align-items-center gap-2 flex-wrap mt-3">
+                <input class="form-control form-control-sm" style="max-width:240px" placeholder="新品牌名稱，例如 A_Brand" @bind="_newBrand" @bind:event="oninput" />
+                <button class="btn btn-outline-primary btn-sm" disabled="@string.IsNullOrWhiteSpace(_newBrand)" @onclick="RequestCreateBrand"><i class="bi bi-plus-lg me-1"></i>新增品牌</button>
+                <span class="hint" style="font-size:0.75rem;">會在 BrandCsv 建立一個空白的 CSV，接著就能在下面的表格輸入網域</span>
+            </div>
             @if (_loadError is not null)
             {
                 <div class="alert alert-danger mt-3 mb-0">@_loadError</div>
@@ -298,6 +303,31 @@ else
     private bool _guardSynced;
 
     private void RefreshBrands() => _brands = Workspace.ListBrands();
+
+    private string _newBrand = "";
+
+    /// <summary>「新增品牌」：建立空白 CSV 後直接切過去，表格會有一列空白列可以開始輸入。
+    /// 切換前跟下拉選單一樣，目前品牌有沒存的修改要先確認。</summary>
+    private async Task RequestCreateBrand()
+    {
+        var name = _newBrand.Trim();
+        string? error;
+        try { error = CsvStore.Create(name); }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            error = $"建立 {name}.csv 失敗：{ex.Message}";
+        }
+        if (error is not null)
+        {
+            _loadError = error;
+            return;
+        }
+
+        _newBrand = "";
+        _brands = Workspace.ListBrands();
+        await RequestSwitchBrand(name);
+        if (_brand == name) _saveMessage = $"已建立 {name}.csv，輸入網域後記得按「儲存」。";
+    }
 
     private async Task RequestSwitchBrand(string brand)
     {
