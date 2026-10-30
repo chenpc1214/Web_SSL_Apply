@@ -122,6 +122,19 @@ public sealed class BrandCsvStore
         return found;
     }
 
+    /// <summary>步驟1 的下拉選單用：已經全部封存完的品牌（CSV 沒有網域了、而且有 _完成.csv）不列出。
+    /// 剛新增還沒輸入網域的品牌沒有 _完成.csv，照樣列出；讀不了的（被 Excel 鎖住）也照樣列出。</summary>
+    public List<string> ListActiveBrands() =>
+        _workspace.ListBrands().Where(b => !IsFinished(b)).ToList();
+
+    private bool IsFinished(string brand)
+    {
+        var completedPath = Path.Combine(_workspace.BrandCsvDir, $"{brand}{ManualWorkspace.CompletedSuffix}.csv");
+        if (!File.Exists(completedPath)) return false;
+        try { return Load(brand).Rows.Count == 0; }
+        catch (IOException) { return false; }
+    }
+
     /// <summary>檔案被別的程式（通常是 Excel）開著鎖住。</summary>
     public static bool IsLocked(IOException ex) =>
         ex is not FileNotFoundException and not DirectoryNotFoundException;

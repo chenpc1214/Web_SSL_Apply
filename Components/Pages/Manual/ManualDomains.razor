@@ -281,9 +281,10 @@ else
                 try
                 {
                     Workspace.EnsureFolders();
-                    _brands = Workspace.ListBrands();
+                    _brands = CsvStore.ListActiveBrands();
                     var saved = await ManualBrandSession.GetAsync(JS);
-                    if (Workspace.BrandExists(saved)) LoadBrand(saved!);
+                    // 記住的品牌如果已經封存完、不在選單裡了，就不自動載入，讓使用者重選
+                    if (saved is not null && _brands.Contains(saved, StringComparer.OrdinalIgnoreCase)) LoadBrand(saved);
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
@@ -302,7 +303,7 @@ else
 
     private bool _guardSynced;
 
-    private void RefreshBrands() => _brands = Workspace.ListBrands();
+    private void RefreshBrands() => _brands = CsvStore.ListActiveBrands();
 
     private string _newBrand = "";
 
@@ -324,7 +325,7 @@ else
         }
 
         _newBrand = "";
-        _brands = Workspace.ListBrands();
+        _brands = CsvStore.ListActiveBrands();
         await RequestSwitchBrand(name);
         if (_brand == name) _saveMessage = $"已建立 {name}.csv，輸入網域後記得按「儲存」。";
     }
