@@ -11,6 +11,7 @@
 @inject CrmVerifyService CrmVerifySvc
 @inject ValidationUploadService FtpSvc
 @inject CertificateOrderRepository OrderRepo
+@inject CsrService CsrSvc
 @inject NicSrsConfigLoader ConfigLoader
 @inject NavigationManager Nav
 @inject IJSRuntime JS
@@ -352,8 +353,20 @@
     private void TakeSavedSnapshot()
     {
         _savedSnapshot.Clear();
-        foreach (var row in _rows) _savedSnapshot[row] = Fingerprint(row);
+        _savedCsrFields.Clear();
+        foreach (var row in _rows)
+        {
+            _savedSnapshot[row] = Fingerprint(row);
+            _savedCsrFields[row] = CsrFields(row);
+        }
     }
+
+    /// <summary>上次存檔（或載入）當下，每一列會寫進 CSR 的欄位——存檔時比對，改了的網域如果已經產生 CSR，
+    /// 那份 CSR 就是舊內容，要提醒使用者刪掉重新產生。CommonName 改了的話，舊資料夾是用舊名稱建的。</summary>
+    private readonly Dictionary<DomainRecord, (string Cn, string Org, string Loc)> _savedCsrFields = new(ReferenceEqualityComparer.Instance);
+
+    private static (string Cn, string Org, string Loc) CsrFields(DomainRecord r) =>
+        (r.CommonName?.Trim() ?? "", r.Organization?.Trim() ?? "", r.Locality?.Trim() ?? "");
 
     private bool HasUnsavedChanges => _rows.Any(r =>
         _savedSnapshot.TryGetValue(r, out var saved) ? saved != Fingerprint(r) : Fingerprint(r) != BlankFingerprint);
@@ -437,22 +450,77 @@
     /// 之後在總覽重新勾選就能再加回來。已簽發的網域取消標記後就不符合這頁的顯示條件，自然消失。</summary>
     private async Task RequestRemoveFromList(DomainRecord row)
     {
-        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
-        {
-            title = $"把「{row.CommonName}」移出這次的清單嗎？",
-            text = "只取消待換發標記，網域資料和訂單紀錄都會保留，之後可以在總覽重新勾選。",
-            confirmText = "移出清單",
-        });
-        if (!confirmed) return;
-
         var name = row.CommonName.Trim();
+        var deleteCsr = await ConfirmWithCsr(name,
+            title: $"把「{name}」移出這次的清單嗎？",
+            text: "只取消待換發標記，網域資料和訂單紀錄都會保留，之後可以在總覽重新勾選。",
+            confirmText: "移出清單",
+            danger: false);
+        if (deleteCsr is null) return;
+
         DomainRepo.SetPendingRenewal(name, false);
         ReloadStatusMaps();
         // 同名的列（例如打名稱自動帶入的那列）一起不再強制顯示，不然取消標記後還會留在畫面上
         _editingRows.RemoveWhere(r => string.Equals(r.CommonName.Trim(), name, StringComparison.OrdinalIgnoreCase));
-        _saveMessage = $"已把「{name}」移出清單（資料保留），{DateTime.Now:HH:mm:ss}";
+        _saveMessage = $"已把「{name}」移出清單（資料保留）{(deleteCsr.Value ? DeleteCsrFolders([name]) : "")}，{DateTime.Now:HH:mm:ss}";
         _pendingRenewalCount = 0; // 上次存檔留下的「已標記待換發」提示已經不成立，不能繼續掛在畫面上
         EnsureAtLeastOneRow();
+    }
+
+    /// <summary>
+    /// 移出清單／刪除的確認視窗，順便處理已經產生的 CSR：
+    /// - 沒有網域資料夾：跟原本一樣的確認視窗。
+    /// - 有 CSR、還沒下單：多一個選項「一起刪除 CSR」（放在 confirm，SweetAlert2 沒載到退回原生視窗時也是選這個）。
+    /// - 已經下單／重簽或憑證已回來：資料夾不能刪（私鑰要配憑證），視窗裡說明會保留。
+    /// 回傳 null＝取消；true＝要一起刪資料夾；false＝不刪。
+    /// </summary>
+    private async Task<bool?> ConfirmWithCsr(string name, string title, string text, string confirmText, bool danger)
+    {
+        switch (CsrSvc.GetFolderState(name))
+        {
+            case CsrFolderState.Deletable:
+                var choice = await JS.InvokeAsync<string>("appDialog.choose", new
+                {
+                    icon = danger ? "warning" : "question",
+                    title,
+                    text = text + $" 這個網域已經產生 CSR／私鑰（還沒下單）。資料有錯的話建議一起刪掉，之後到步驟2重新產生；不刪的話資料夾會留在 {WorkRootResolver.DomainFolderSubDir}。",
+                    confirmText = $"{confirmText}，一起刪除 CSR",
+                    denyText = $"{confirmText}，保留 CSR",
+                });
+                return choice switch { "confirm" => true, "deny" => false, _ => null };
+
+            case CsrFolderState.InUse:
+                text += " 這個網域這一輪已經下單／重簽（或憑證已經回來），網域資料夾裡的 CSR、私鑰會保留，不會刪除。";
+                break;
+        }
+
+        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+        {
+            icon = danger ? "warning" : "question",
+            title,
+            text,
+            confirmText,
+            danger,
+        });
+        return confirmed ? false : null;
+    }
+
+    /// <summary>刪除這幾個網域的資料夾（CSR、私鑰），回傳接在存檔訊息後面的說明。</summary>
+    private string DeleteCsrFolders(IReadOnlyCollection<string> names)
+    {
+        var failed = new List<string>();
+        foreach (var name in names)
+        {
+            try { CsrSvc.DeleteAndRestart(name); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                failed.Add($"{name}（{ex.Message}）");
+            }
+        }
+        var deleted = names.Count - failed.Count;
+        var message = deleted > 0 ? $"，已刪除 {deleted} 個網域的舊 CSR，請到步驟2重新產生" : "";
+        if (failed.Count > 0) message += $"；CSR 資料夾刪不掉（檔案可能被開著）：{string.Join("、", failed)}，請到步驟2按「刪除並重新開始」";
+        return message;
     }
 
     private async Task RequestDelete(DomainRecord row)
@@ -467,17 +535,16 @@
             return;
         }
 
-        var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
-        {
-            icon = "warning",
-            title = $"確定要刪除「{row.CommonName}」嗎？",
-            text = "會立即從資料庫刪除，無法復原。",
-            confirmText = "確定刪除",
-            danger = true,
-        });
-        if (!confirmed) return;
+        var name = row.CommonName.Trim();
+        var deleteCsr = await ConfirmWithCsr(name,
+            title: $"確定要刪除「{name}」嗎？",
+            text: "會立即從資料庫刪除，無法復原。",
+            confirmText: "確定刪除",
+            danger: true);
+        if (deleteCsr is null) return;
 
         DomainRepo.Delete(row.CommonName);
+        if (deleteCsr.Value) _saveMessage = $"已刪除「{name}」{DeleteCsrFolders([name])}，{DateTime.Now:HH:mm:ss}";
         _orderMap.Remove(row.CommonName.Trim()); // Delete 連訂單一起刪了，同名重新新增時不能被當成舊網域
         _pendingRenewalMap.Remove(row.CommonName.Trim());
         _pendingModeMap.Remove(row.CommonName.Trim());
@@ -520,7 +587,56 @@
             return;
         }
 
-        await RequestConfirmedAction(DoSave, isExport: false);
+        var staleCsr = await ConfirmStaleCsr(VisibleRows);
+        if (staleCsr is null) return;
+
+        await RequestConfirmedAction(async () =>
+        {
+            await DoSave();
+            if (staleCsr.Count > 0) _saveMessage += DeleteCsrFolders(staleCsr);
+        }, isExport: false);
+    }
+
+    /// <summary>
+    /// 存檔前：改了 CommonName／Organization／Locality 的網域，如果已經產生 CSR，那份 CSR 還是舊內容，
+    /// 步驟2 看到資料夾已存在會直接跳過，送出去的就是錯的 CSR。這裡列出來問要不要刪掉舊 CSR；
+    /// 已經下單／重簽的只提醒、不能刪。回傳 null＝取消存檔；否則是存檔後要刪資料夾的網域（用舊名稱）。
+    /// </summary>
+    private async Task<List<string>?> ConfirmStaleCsr(IEnumerable<DomainRecord> rows)
+    {
+        var changed = rows
+            .Where(r => _savedCsrFields.TryGetValue(r, out var old) && old.Cn.Length > 0 && old != CsrFields(r))
+            .Select(r => _savedCsrFields[r].Cn)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var deletable = changed.Where(n => CsrSvc.GetFolderState(n) == CsrFolderState.Deletable).ToList();
+        var inUse = changed.Where(n => CsrSvc.GetFolderState(n) == CsrFolderState.InUse).ToList();
+        if (deletable.Count == 0 && inUse.Count == 0) return [];
+
+        var items = deletable.Concat(inUse.Select(n => $"{n}（已經下單／重簽，CSR 不會刪）")).ToList();
+        if (deletable.Count == 0)
+        {
+            var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+            {
+                icon = "warning",
+                title = "這幾個網域已經下單，改了資料也不會反映在這次的憑證上",
+                text = "改了 CommonName／Organization／Locality，但這一輪已經用舊資料下單／重簽了，CSR 和私鑰會保留。仍要存檔嗎？",
+                items,
+                confirmText = "仍要存檔",
+            });
+            return confirmed ? [] : null;
+        }
+
+        var choice = await JS.InvokeAsync<string>("appDialog.choose", new
+        {
+            icon = "warning",
+            title = "這幾個網域已經產生 CSR，內容是舊的",
+            text = "改了 CommonName／Organization／Locality，舊的 CSR 不會自己更新，步驟2 看到資料夾已經存在會直接跳過。建議刪掉舊 CSR，存檔後到步驟2重新產生。",
+            items,
+            confirmText = "存檔並刪除舊 CSR",
+            denyText = "只存檔，保留舊 CSR",
+        });
+        return choice switch { "confirm" => deletable, "deny" => [], _ => null };
     }
 
     private Task RequestExportCsv() => RequestConfirmedAction(() => { DoExportCsv(); return Task.CompletedTask; }, isExport: true);

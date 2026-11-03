@@ -97,4 +97,32 @@ public sealed class CsrService
 
     public bool DomainFolderExists(string commonName, string? workRootOverride = null) =>
         Directory.Exists(_workRoot.DomainDir(commonName, workRootOverride));
+
+    /// <summary>
+    /// 步驟1 刪除網域、或改了會寫進 CSR 的欄位時，判斷舊的網域資料夾能不能一起刪：
+    /// 已經下單／重簽（有 .certid、.replace.json）或憑證已經回來（有 .crt）的不能刪——
+    /// 憑證商簽回來的憑證要配資料夾裡這把私鑰，刪掉就裝不起來了。作廢過的訂單 .certid 已改名，不算下單。
+    /// </summary>
+    public CsrFolderState GetFolderState(string commonName, string? workRootOverride = null)
+    {
+        if (string.IsNullOrWhiteSpace(commonName)) return CsrFolderState.None;
+        var workDir = _workRoot.DomainDir(commonName.Trim(), workRootOverride);
+        if (!Directory.Exists(workDir)) return CsrFolderState.None;
+
+        var folderName = DomainFolderNaming.ToFolderName(commonName.Trim());
+        var inUse = File.Exists(Path.Combine(workDir, $"{folderName}.certid"))
+            || File.Exists(Path.Combine(workDir, $"{folderName}.replace.json"))
+            || Directory.EnumerateFiles(workDir, "*.crt").Any();
+        return inUse ? CsrFolderState.InUse : CsrFolderState.Deletable;
+    }
+}
+
+public enum CsrFolderState
+{
+    /// <summary>還沒產生 CSR（沒有網域資料夾）。</summary>
+    None,
+    /// <summary>有 CSR／私鑰，還沒下單、憑證也還沒回來，可以刪掉重來。</summary>
+    Deletable,
+    /// <summary>已經下單／重簽，或憑證已經回來，不能刪。</summary>
+    InUse,
 }

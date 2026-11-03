@@ -11,6 +11,7 @@
 @inject CrmVerifyService CrmVerifySvc
 @inject ValidationUploadService FtpSvc
 @inject NicSrsConfigLoader ConfigLoader
+@inject CsrService CsrSvc
 @inject IJSRuntime JS
 
 <PageTitle>步驟1 · 品牌清單 / DNS 驗證</PageTitle>
@@ -103,7 +104,7 @@ else
                                         </select>
                                     </td>
                                     <td data-label="進度"><span class="badge @progress.Css">@progress.Label</span></td>
-                                    <td class="text-end"><button class="btn-icon danger" title="從清單移除（按「儲存」才會寫回 CSV；網域資料夾不會被刪）" @onclick="() => RemoveRow(row)"><i class="bi bi-trash"></i></button></td>
+                                    <td class="text-end"><button class="btn-icon danger" title="從清單移除（按「儲存」才會寫回 CSV；已經產生 CSR 的，存檔時會問要不要一起刪）" @onclick="() => RemoveRow(row)"><i class="bi bi-trash"></i></button></td>
                                 </tr>
                             }
                         </tbody>
@@ -406,9 +407,21 @@ else
     private void TakeSavedSnapshot()
     {
         _savedSnapshot.Clear();
-        foreach (var row in _rows) _savedSnapshot[row] = Fingerprint(row);
+        _savedCsrFields.Clear();
+        foreach (var row in _rows)
+        {
+            _savedSnapshot[row] = Fingerprint(row);
+            _savedCsrFields[row] = CsrFields(row);
+        }
         _savedCount = _rows.Count(r => Fingerprint(r) != BlankFingerprint);
     }
+
+    /// <summary>上次載入/存檔當下，每一列會寫進 CSR 的欄位。存檔時拿來找「移除了、或改了 CSR 欄位」的網域——
+    /// 那些網域已經產生的 CSR 不是孤兒就是舊內容，要問使用者要不要刪。CommonName 改了的話，舊資料夾是用舊名稱建的。</summary>
+    private readonly Dictionary<DomainRecord, (string Cn, string Org, string Loc)> _savedCsrFields = new(ReferenceEqualityComparer.Instance);
+
+    private static (string Cn, string Org, string Loc) CsrFields(DomainRecord r) =>
+        (r.CommonName?.Trim() ?? "", r.Organization?.Trim() ?? "", r.Locality?.Trim() ?? "");
 
     private bool HasUnsavedChanges =>
         _snapshot is not null &&
@@ -488,11 +501,14 @@ else
             return;
         }
 
+        var staleCsr = await ConfirmStaleCsr();
+        if (staleCsr is null) return;
+
         try
         {
             _snapshot = CsvStore.Save(_snapshot, named);
             TakeSavedSnapshot();
-            _saveMessage = $"已儲存 {named.Count} 筆到 {_snapshot.Brand}.csv，{DateTime.Now:HH:mm:ss}";
+            _saveMessage = $"已儲存 {named.Count} 筆到 {_snapshot.Brand}.csv{DeleteCsrFolders(staleCsr)}，{DateTime.Now:HH:mm:ss}";
         }
         catch (BrandCsvChangedException ex)
         {
@@ -506,6 +522,68 @@ else
         {
             _saveMessage = $"沒有權限寫入 {_snapshot.Brand}.csv：{ex.Message}";
         }
+    }
+
+    /// <summary>
+    /// 存檔前：從清單移除的、或改了 CommonName／Organization／Locality 的網域，如果已經產生 CSR，
+    /// 那份 CSR 不是沒人用的孤兒，就是舊內容（步驟2 看到資料夾已存在會直接跳過）。列出來問要不要一起刪；
+    /// 憑證已經匯入的不能刪（私鑰要配憑證）。移除後又用同樣資料加回來的不算。
+    /// 回傳 null＝取消存檔；否則是存檔後要刪資料夾的網域（用舊名稱）。
+    /// </summary>
+    private async Task<List<string>?> ConfirmStaleCsr()
+    {
+        var current = _rows.Select(CsrFields).ToHashSet();
+        var changed = _savedCsrFields
+            .Where(kv => kv.Value.Cn.Length > 0 && !current.Contains(kv.Value))
+            .Select(kv => kv.Value.Cn)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        var deletable = changed.Where(n => CsrSvc.GetFolderState(n, Workspace.DomainRoot) == CsrFolderState.Deletable).ToList();
+        var inUse = changed.Where(n => CsrSvc.GetFolderState(n, Workspace.DomainRoot) == CsrFolderState.InUse).ToList();
+        if (deletable.Count == 0 && inUse.Count == 0) return [];
+
+        var items = deletable.Concat(inUse.Select(n => $"{n}（憑證已經匯入，CSR 不會刪）")).ToList();
+        if (deletable.Count == 0)
+        {
+            var confirmed = await JS.InvokeAsync<bool>("appDialog.confirm", new
+            {
+                icon = "warning",
+                title = "這幾個網域的憑證已經回來了",
+                text = "移除了、或改了 CommonName／Organization／Locality，但憑證已經用舊資料簽好匯入了，網域資料夾會保留。仍要存檔嗎？",
+                items,
+                confirmText = "仍要存檔",
+            });
+            return confirmed ? [] : null;
+        }
+
+        var choice = await JS.InvokeAsync<string>("appDialog.choose", new
+        {
+            icon = "warning",
+            title = "這幾個網域已經產生 CSR",
+            text = "移除了、或改了 CommonName／Organization／Locality，舊的 CSR 用不到了（改資料的話，步驟2 看到資料夾已經存在會直接跳過）。建議一起刪掉，有需要再到步驟2重新產生。",
+            items,
+            confirmText = "存檔並刪除舊 CSR",
+            denyText = "只存檔，保留舊 CSR",
+        });
+        return choice switch { "confirm" => deletable, "deny" => [], _ => null };
+    }
+
+    /// <summary>刪除這幾個網域的資料夾（CSR、私鑰），回傳接在存檔訊息後面的說明。</summary>
+    private string DeleteCsrFolders(IReadOnlyCollection<string> names)
+    {
+        var failed = new List<string>();
+        foreach (var name in names)
+        {
+            try { CsrSvc.DeleteAndRestart(name, Workspace.DomainRoot); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                failed.Add($"{name}（{ex.Message}）");
+            }
+        }
+        var deleted = names.Count - failed.Count;
+        var message = deleted > 0 ? $"，已刪除 {deleted} 個網域的舊 CSR" : "";
+        if (failed.Count > 0) message += $"；CSR 資料夾刪不掉（檔案可能被開著）：{string.Join("、", failed)}";
+        return message;
     }
 
     private async Task RunDnsCheck()
